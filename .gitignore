@@ -1,10 +1,13 @@
+# godot-cpp submodule
 godot-cpp/
-demo/bin/
-*.so
-*.dll
-*.framework/
+
+# Build artifacts
+addons/fluid_particles/bin/
 *.os
+*.o
 *.a
 .sconsign.dblite
+
+# Godot editor metadata
 *.import
 *.uid

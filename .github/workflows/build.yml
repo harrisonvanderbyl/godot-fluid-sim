@@ -1,0 +1,151 @@
+name: Build GDExtension
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            platform: linux
+            artifact-name: linux-x86_64
+          - name: linux-arm64
+            os: ubuntu-22.04-arm
+            platform: linux
+            artifact-name: linux-arm64
+            extra-args: arch=arm64
+          - name: windows-x86_64
+            os: windows-2022
+            platform: windows
+            artifact-name: windows-x86_64
+          - name: windows-arm64
+            os: windows-11-arm
+            platform: windows
+            artifact-name: windows-arm64
+            extra-args: arch=arm64
+          - name: macos-universal
+            os: macos-14
+            platform: macos
+            artifact-name: macos
+            extra-args: arch=universal
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install SCons
+        run: |
+          python -m pip install --upgrade pip
+          pip install scons
+
+      - name: Build
+        run: |
+          scons platform=${{ matrix.platform }} target=template_debug ${{ matrix.extra-args }}
+          scons platform=${{ matrix.platform }} target=template_release ${{ matrix.extra-args }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fluid-particles-${{ matrix.artifact-name }}
+          path: addons/fluid_particles/bin/
+
+  bundle:
+    name: Bundle addon
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: false
+
+      - name: Assemble addon folder
+        run: |
+          echo "=== Full contents of artifacts/ ==="
+          find artifacts -type f | sort
+          echo ""
+          mkdir -p addon/fluid_particles/bin
+
+          # Copy non-binary addon files from the repo (shaders, .gdextension, plugin.cfg, plugin.gd)
+          cp addons/fluid_particles/fluid_particles.gdextension addon/fluid_particles/
+          cp addons/fluid_particles/plugin.cfg addon/fluid_particles/
+          cp addons/fluid_particles/plugin.gd addon/fluid_particles/
+          cp -r addons/fluid_particles/shaders addon/fluid_particles/
+
+          # Merge built binaries from each platform artifact into bin/
+          for dir in artifacts/*/; do
+            name=$(basename "$dir")
+            case "$name" in
+              fluid-particles-linux-*)    platform="linux" ;;
+              fluid-particles-windows-*)  platform="windows" ;;
+              fluid-particles-macos)      platform="macos" ;;
+              *)                          platform="" ;;
+            esac
+            if [ -n "$platform" ]; then
+              echo "Merging $name -> $platform"
+              find "$dir" -type f \( -name '*.so' -o -name '*.dll' -o -name '*.dylib' \) \
+                -exec cp {} addon/fluid_particles/bin/ \;
+            fi
+          done
+
+          echo ""
+          echo "=== Final addon/ structure ==="
+          find addon -type f | sort
+
+      - name: Upload bundled addon
+        uses: actions/upload-artifact@v4
+        with:
+          name: fluid-particles-addon
+          path: addon/
+
+  release:
+    name: Create release
+    needs: bundle
+    runs-on: ubuntu-22.04
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - name: Download bundled addon
+        uses: actions/download-artifact@v4
+        with:
+          name: fluid-particles-addon
+          path: fluid_particles
+
+      - name: Zip addon
+        run: zip -r fluid-particles-addon.zip fluid_particles/
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name == 'main' && 'latest-build' || github.ref_name }}
+          name: ${{ github.ref_name == 'main' && 'Latest Build' || github.ref_name }}
+          body: |
+            Auto-built GDExtension from commit ${{ github.sha }}.
+
+            Download `fluid-particles-addon.zip`, unzip it into your Godot project's
+            `addons/` folder, and enable **Fluid Particles** in Project Settings → Plugins.
+
+            Requires Godot 4.8+.
+          files: fluid-particles-addon.zip
+          prerelease: ${{ startsWith(github.ref, 'refs/tags/v') && false || true }}

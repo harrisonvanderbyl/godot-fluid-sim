@@ -1,6 +1,6 @@
 [configuration]
 entry_symbol = "gdext_particles_init"
-compatibility_minimum = "4.3"
+compatibility_minimum = "4.8"
 
 [libraries]
 linux.debug.x86_64   = "res://addons/fluid_particles/bin/libgodot_ext_particles.linux.template_debug.x86_64.so"

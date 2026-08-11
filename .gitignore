@@ -1,6 +1,3 @@
-# godot-cpp submodule
-godot-cpp/
-
 # Build artifacts
 addons/fluid_particles/bin/
 *.os

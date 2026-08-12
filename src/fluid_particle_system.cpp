@@ -27,17 +27,23 @@ struct PushConstants {
     float   surface_tension;
     float   water_viscosity;
     float   attraction_force;
-    float   _pad0;
-    float   gravity[3];      // vec3 in grid space — local or world depending on gravity_local
-    int32_t frame_count;
-    float   global_vel[3];
     int32_t neighbor_mode;
+    float   gravity[3];      // vec3 in grid space
+    int32_t frame_count;
     int32_t num_runnable;
     int32_t vertex_stride_floats;
     int32_t attrib_stride_words;
     int32_t color_offset_words;
     int32_t custom0_offset_words;
-};
+    float   has_delta;       // 1.0 if delta transform is non-identity
+    float   _pad0, _pad1;
+    // Delta transform as 3 vec4 rows (row-major 3x4 matrix):
+    //   row0 = (m00, m01, m02, origin_x)
+    //   row1 = (m10, m11, m12, origin_y)
+    //   row2 = (m20, m21, m22, origin_z)
+    // Per-particle displacement: dp = M * p + origin - p
+    float   delta_row[12];
+};  // 128 bytes
 
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -82,6 +88,8 @@ void FluidParticleSystem::_bind_methods() {
                          &FluidParticleSystem::spawn_block);
     ClassDB::bind_method(D_METHOD("add_velocity_impulse","impulse"),
                          &FluidParticleSystem::add_velocity_impulse);
+    ClassDB::bind_method(D_METHOD("add_rotational_impulse","center","axis_amount"),
+                         &FluidParticleSystem::add_rotational_impulse);
     ClassDB::bind_method(D_METHOD("reset_grid"),
                          &FluidParticleSystem::reset_grid);
 
@@ -132,10 +140,10 @@ void FluidParticleSystem::_bind_methods() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-void FluidParticleSystem::set_grid_width(int v)   { grid_width  = v; }
-void FluidParticleSystem::set_grid_height(int v)  { grid_height = v; }
-void FluidParticleSystem::set_grid_depth(int v)   { grid_depth  = v; }
-void FluidParticleSystem::set_num_particles(int v){ num_particles = v; }
+void FluidParticleSystem::set_grid_width(int v)   { grid_width  = v; _rebuild_gpu_resources(); }
+void FluidParticleSystem::set_grid_height(int v)  { grid_height = v; _rebuild_gpu_resources(); }
+void FluidParticleSystem::set_grid_depth(int v)   { grid_depth  = v; _rebuild_gpu_resources(); }
+void FluidParticleSystem::set_num_particles(int v){ num_particles = v; _rebuild_gpu_resources(); }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Default render shader path. Used to pre-fill the render_shader resource when
@@ -460,6 +468,29 @@ void FluidParticleSystem::_destroy_gpu_resources() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Called from property setters (num_particles, grid_*) when a size-affecting
+// property changes while the node is in the tree. Tears down all GPU resources
+// and rebuilds them from scratch with the new dimensions.
+// ─────────────────────────────────────────────────────────────────────────────
+void FluidParticleSystem::_rebuild_gpu_resources() {
+    if (!is_inside_tree()) return;  // _enter_tree will build on first entry
+    _destroy_gpu_resources();
+
+    // render_mesh owns vertex_buf/attrib_buf; release it so the old mesh (and
+    // its storage buffers) are freed before we create new ones.
+    if (render_mesh.is_valid()) {
+        render_mesh.unref();
+    }
+    // render_node still references the old mesh; update it after rebuild.
+    if (render_node) {
+        render_node->set_mesh(Ref<ArrayMesh>());
+    }
+
+    _build_gpu_resources();
+    _ensure_render_node();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 void FluidParticleSystem::_process(double delta) {
     if (!gpu_ready) return;
 
@@ -467,11 +498,55 @@ void FluidParticleSystem::_process(double delta) {
     // reflects the last GPU state, so there's nothing to do when paused.
     if (!simulation_active) return;
 
-    Vector3 impulse = Vector3();
-    if (impulse_pending) {
-        impulse = pending_impulse;
-        impulse_pending = false;
+    // ── Compute impulses from node movement ───────────────────────────────
+    // The fluid lives in the node's local (grid) space. When the node moves or
+    // rotates in the world, the fluid — which has its own momentum in grid
+    // space — should resist that motion as if it were a separate body.
+    //
+    // We compute the full delta transform: D = T_cur^-1 * T_prev.
+    // For a particle at grid position p, the point where it "would have been"
+    // (in the new grid space) is D(p) = D.basis * p + D.origin.
+    // The displacement is dp = D(p) - p. The shader subtracts dp from each
+    // particle's position, giving it inertia. This correctly handles:
+    //   - Pure translation (uniform shift)
+    //   - Rotation about the container center (tangential field)
+    //   - Rotation about an off-center point (swinging on a string)
+    //   - Any combination of translation + rotation
+    // Accumulate explicit rotational/transform impulses from script calls.
+    // add_velocity_impulse and add_rotational_impulse both compose into the
+    // delta transform (pending_delta_basis / pending_delta_origin).
+    Basis delta_basis = Basis();  // identity
+    Vector3 delta_origin = Vector3();
+    bool has_delta = false;
+
+    if (delta_impulse_pending) {
+        delta_basis = pending_delta_basis;
+        delta_origin = pending_delta_origin;
+        has_delta = true;
+        delta_impulse_pending = false;
     }
+
+    // Transform-delta impulse from node movement.
+    Transform3D cur_xform = get_global_transform();
+    if (has_prev_transform) {
+        // D = T_prev^-1 * T_cur — the container's forward motion.
+        // The shader computes dp = D(p) - p (how the container moved) and
+        // subtracts it, so particles resist the motion (inertia).
+        // affine_inverse handles scale; plain inverse assumes rotation only.
+        Transform3D delta_xform = prev_global_transform.affine_inverse() * cur_xform;
+
+        if (has_delta) {
+            // Compose: existing explicit delta * node-movement delta
+            delta_basis = delta_xform.basis * delta_basis;
+            delta_origin = delta_xform.basis.xform(delta_origin) + delta_xform.origin;
+        } else {
+            delta_basis = delta_xform.basis;
+            delta_origin = delta_xform.origin;
+        }
+        has_delta = true;
+    }
+    prev_global_transform = cur_xform;
+    has_prev_transform = true;
 
     // NOTE: No per-frame clear — the chunk grid stores persistent velocity state
     // that is read-consumed by swap0() and re-written by atomic_plus_equals().
@@ -480,7 +555,7 @@ void FluidParticleSystem::_process(double delta) {
     // _build_gpu_resources() and only cleared explicitly via reset_grid().
 
     // 1. Physics step (velocity_spread.glsl)
-    _dispatch_physics(impulse);
+    _dispatch_physics(Vector3(), delta_basis, delta_origin, has_delta);
 
     // 2. Source/sink children dispatch into the same RD command buffer
     for (int i = 0; i < get_child_count(); i++) {
@@ -537,13 +612,15 @@ void FluidParticleSystem::_dispatch_clear_grid() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-void FluidParticleSystem::_dispatch_physics(Vector3 global_add_velocity) {
+void FluidParticleSystem::_dispatch_physics(Vector3 global_add_velocity,
+                                             const Basis &delta_basis,
+                                             Vector3 delta_origin,
+                                             bool has_delta) {
     // Resolve gravity into grid (local) space.
-    // The grid lives in the node's local space, so world-space gravity must be
-    // transformed by the inverse of the node's global basis.
     Vector3 grav = gravity_vec;
     if (!gravity_local) {
-        // World-space gravity → transform into node local space
+        // Basis::inverse() does a full matrix inverse (cofactor method),
+        // so it handles scale correctly (unlike Transform3D::inverse()).
         Basis inv_basis = get_global_transform().basis.inverse();
         grav = inv_basis.xform(grav);
     }
@@ -556,19 +633,33 @@ void FluidParticleSystem::_dispatch_physics(Vector3 global_add_velocity) {
     pc.surface_tension  = surface_tension;
     pc.water_viscosity  = water_viscosity;
     pc.attraction_force = attraction_force;
+    pc.neighbor_mode    = neighbor_mode;
     pc.gravity[0]       = grav.x;
     pc.gravity[1]       = grav.y;
     pc.gravity[2]       = grav.z;
-    pc.global_vel[0]    = global_add_velocity.x;
-    pc.global_vel[1]    = global_add_velocity.y;
-    pc.global_vel[2]    = global_add_velocity.z;
     pc.frame_count      = (int32_t)(frame_count & 0x7fffffff);
-    pc.neighbor_mode    = neighbor_mode;
     pc.num_runnable     = num_particles;
     pc.vertex_stride_floats = vertex_stride_floats;
     pc.attrib_stride_words  = attrib_stride_words;
     pc.color_offset_words   = color_offset_words;
     pc.custom0_offset_words = custom0_offset_words;
+    pc.has_delta        = has_delta ? 1.0f : 0.0f;
+    // Pack 3x3 basis + origin into 3 vec4 rows (row-major):
+    //   row0 = (m00, m01, m02, origin_x)
+    //   row1 = (m10, m11, m12, origin_y)
+    //   row2 = (m20, m21, m22, origin_z)
+    pc.delta_row[0]  = delta_basis.rows[0].x;
+    pc.delta_row[1]  = delta_basis.rows[0].y;
+    pc.delta_row[2]  = delta_basis.rows[0].z;
+    pc.delta_row[3]  = delta_origin.x;
+    pc.delta_row[4]  = delta_basis.rows[1].x;
+    pc.delta_row[5]  = delta_basis.rows[1].y;
+    pc.delta_row[6]  = delta_basis.rows[1].z;
+    pc.delta_row[7]  = delta_origin.y;
+    pc.delta_row[8]  = delta_basis.rows[2].x;
+    pc.delta_row[9]  = delta_basis.rows[2].y;
+    pc.delta_row[10] = delta_basis.rows[2].z;
+    pc.delta_row[11] = delta_origin.z;
 
     uint32_t groups = (uint32_t)((num_particles + 63) / 64);
     dispatch_compute(rd, physics_pipeline, physics_uniform_set, pc, groups);
@@ -612,8 +703,52 @@ void FluidParticleSystem::spawn_block(Vector3 origin, int w, int h, int d,
 
 // ─────────────────────────────────────────────────────────────────────────────
 void FluidParticleSystem::add_velocity_impulse(Vector3 impulse) {
-    pending_impulse  = impulse;
-    impulse_pending  = true;
+    // Compose a pure translation into the pending delta transform.
+    // D(p) = pending_delta_basis * p + (pending_delta_origin + impulse)
+    if (!delta_impulse_pending) {
+        pending_delta_basis = Basis();  // identity
+        pending_delta_origin = Vector3();
+        delta_impulse_pending = true;
+    }
+    pending_delta_origin += impulse;
+}
+
+void FluidParticleSystem::add_rotational_impulse(Vector3 center, Vector3 axis_amount) {
+    // Build a rotation matrix about the given center by the angle |axis_amount|
+    // around the axis axis_amount.normalized(). Then compose it into the
+    // pending delta transform so the shader applies it per-particle.
+    //
+    // The rotation transform is: R(p) = M * (p - center) + center
+    //   = M * p + (center - M * center)
+    // So delta_basis = M, delta_origin = center - M * center.
+    float angle = axis_amount.length();
+    if (angle < 1e-8f) return;
+    Vector3 axis = axis_amount / angle;
+
+    // Rodrigues' rotation formula → 3x3 matrix
+    float c = cosf(angle);
+    float s = sinf(angle);
+    float t = 1.0f - c;
+    float x = axis.x, y = axis.y, z = axis.z;
+    Basis M(
+        Vector3(t*x*x + c,    t*x*y - s*z,  t*x*z + s*y),
+        Vector3(t*x*y + s*z,  t*y*y + c,    t*y*z - s*x),
+        Vector3(t*x*z - s*y,  t*y*z + s*x,  t*z*z + c)
+    );
+
+    Vector3 origin = center - M.xform(center);
+
+    if (!delta_impulse_pending) {
+        pending_delta_basis = M;
+        pending_delta_origin = origin;
+        delta_impulse_pending = true;
+    } else {
+        // Compose: new_delta(p) = M * (old_delta(p)) + origin
+        //   = M * (old_basis * p + old_origin) + origin
+        //   = (M * old_basis) * p + (M * old_origin + origin)
+        pending_delta_basis = M * pending_delta_basis;
+        pending_delta_origin = M.xform(pending_delta_origin) + origin;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

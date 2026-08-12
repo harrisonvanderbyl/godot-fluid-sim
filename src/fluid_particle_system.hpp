@@ -45,6 +45,9 @@ public:
     void set_grid_height(int v);    int get_grid_height()    const { return grid_height; }
     void set_grid_depth(int v);     int get_grid_depth()     const { return grid_depth; }
     void set_num_particles(int v);  int get_num_particles()  const { return num_particles; }
+
+    // Rebuild all GPU resources (buffers, pipelines, render mesh) after a
+    // property change that affects buffer sizes. No-op if not in the tree.
     void set_gravity(Vector3 v)    { gravity_vec = v; }
     Vector3 get_gravity()           const { return gravity_vec; }
     void set_gravity_local(bool v)  { gravity_local = v; }
@@ -91,6 +94,7 @@ public:
     // Spawn helpers callable from GDScript
     void spawn_block(Vector3 origin, int w, int h, int d, Color color, float attraction);
     void add_velocity_impulse(Vector3 impulse);
+    void add_rotational_impulse(Vector3 center, Vector3 axis_amount);
     void reset_grid();  // explicitly clear chunk grid (occupants + velocities)
 
     // Grid bounding box, used by the editor gizmo (plugin.gd)
@@ -133,7 +137,7 @@ private:
     int   grid_height     = 256;    // aheight
     int   grid_depth      = 256;    // adepth
     int   num_particles   = 262144; // 100*100*100
-    Vector3 gravity_vec   = Vector3(0, -0.1f, 0);  // gravity vector (world or local)
+    Vector3 gravity_vec   = Vector3(0, 0.1f, 0);  // gravity vector (world or local)
     bool    gravity_local = true;   // if true, transformed by node basis into grid space
     float surface_tension = 1.1f;   // surfaceTension
     float water_viscosity = 1.0f;   // waterviscosity
@@ -196,8 +200,15 @@ private:
 
     // ── runtime state ──────────────────────────────────────────────────────
     uint64_t  frame_count  = 0;
-    Vector3   pending_impulse;
-    bool      impulse_pending = false;
+    // Explicit rotational/transform impulses: accumulated as a delta transform.
+    // add_velocity_impulse composes a translation; add_rotational_impulse
+    // composes a rotation about a center. Both are applied per-particle in the
+    // shader via: dp = delta_basis * p + delta_origin - p
+    Basis    pending_delta_basis;
+    Vector3  pending_delta_origin;
+    bool     delta_impulse_pending = false;
+    Transform3D prev_global_transform;  // for computing node-movement impulses
+    bool      has_prev_transform = false;
     bool      gpu_ready    = false;
 
     // ── render mesh ──────────────────────────────────────────────────────────
@@ -210,8 +221,12 @@ private:
     void _ensure_render_node();
     void _build_gpu_resources();
     void _destroy_gpu_resources();
+    void _rebuild_gpu_resources();
     void _dispatch_clear_grid();
-    void _dispatch_physics(Vector3 global_add_velocity);
+    void _dispatch_physics(Vector3 global_add_velocity,
+                           const Basis &delta_basis,
+                           Vector3 delta_origin,
+                           bool has_delta);
     void _dispatch_sortkey();
 };
 

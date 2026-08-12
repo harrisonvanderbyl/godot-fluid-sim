@@ -12,16 +12,22 @@ layout(push_constant, std430) uniform PushConstants {
     float surface_tension;
     float water_viscosity;
     float attraction_force;
-    float _pad0;         // padding before vec3s
+    int   neighbor_mode;
     vec3  gravity;       // gravity vector in grid space
     int   frame_count;
-    vec3  global_vel;
-    int   neighbor_mode;
     int   num_runnable;
     int   vertex_stride_floats;
     int   attrib_stride_words;
     int   color_offset_words;
     int   custom0_offset_words;
+    float has_delta;     // 1.0 if delta transform is non-identity
+    float _pad0, _pad1;
+    // Delta transform as 3 vec4 rows (row-major 3x4 matrix):
+    //   row0 = (m00, m01, m02, origin_x)
+    //   row1 = (m10, m11, m12, origin_y)
+    //   row2 = (m20, m21, m22, origin_z)
+    // Per-particle displacement: dp = M * p + origin - p
+    vec4  delta_row[3];
 } pc;
 
 // ── Buffers ───────────────────────────────────────────────────────────────────
@@ -121,8 +127,25 @@ void main() {
     float opacity_fade         = c0.y;
     float neighbors_filled     = c0.z;
 
-    if (length(pc.global_vel) > 0.0) opacity_fade = 1.0;
     if (opacity_fade < 1.0) opacity_fade += 1.0 / 60.0;
+
+    // Per-particle displacement from the container's rigid-body motion.
+    // delta_row encodes D = T_cur^-1 * T_prev as a row-major 3x4 matrix:
+    //   dp = M * p + origin - p
+    // is the vector from where the particle is now (in the new grid space) to
+    // where it would have been if the container hadn't moved. Subtracting dp
+    // from the particle's position gives it inertia — it resists the container's
+    // motion. This correctly handles rotation about any point (including
+    // off-center "swinging"), translation, and any combination.
+    vec3 container_impulse = vec3(0.0);
+    if (pc.has_delta > 0.5) {
+        vec3 dp;
+        dp.x = dot(pc.delta_row[0].xyz, position) + pc.delta_row[0].w - position.x;
+        dp.y = dot(pc.delta_row[1].xyz, position) + pc.delta_row[1].w - position.y;
+        dp.z = dot(pc.delta_row[2].xyz, position) + pc.delta_row[2].w - position.z;
+        container_impulse = dp;
+    }
+    if (length(container_impulse) > 0.0) opacity_fade = 1.0;
 
     bool  firststep    = false;
     ivec3 old_cell_pos = ivec3(round(position));
@@ -157,7 +180,21 @@ void main() {
 
     if (allfilled < n_size - n_allowance || !me_solid) {
         neighbors_filled = float(allfilled * 15) / float(n_size) * (1.0 - mix_f) + neighbors_filled * mix_f;
-        position += momentum - pc.global_vel;
+        
+        if (pc.has_delta > 0.5) {
+            vec3 mrot;
+            mrot.x = dot(pc.delta_row[0].xyz, momentum);
+            mrot.y = dot(pc.delta_row[1].xyz, momentum);
+            mrot.z = dot(pc.delta_row[2].xyz, momentum);
+            momentum = mrot;
+        }
+        position += momentum - container_impulse;
+        // Rotate the collected velocity by the container's rotation delta so
+        // the velocity field stays in the correct frame. This makes centrifugal
+        // outflow emerge naturally: the velocity vector is carried with the
+        // container's rotation, so a particle that was moving outward keeps
+        // moving outward in the rotated frame — producing the swirl.
+      
         if (firststep) attract = 0.0;
         if (!me_solid) {
             float coverage = float(n_size - allfilled + 1) / float(n_size);
@@ -190,7 +227,7 @@ void main() {
     if (new_cell_pos != old_cell_pos) {
         if (!cell_try_place(new_cidx, particle_idx)) {
             position     = vec3(old_cell_pos);
-            cell_atomic_add(new_cidx, momentum * 0.5);
+            cell_atomic_add(new_cidx, momentum * 0.45);
             momentum    *= 0.45;
             new_cell_pos = old_cell_pos;
         } else {

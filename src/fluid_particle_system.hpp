@@ -97,6 +97,15 @@ public:
     void add_rotational_impulse(Vector3 center, Vector3 axis_amount);
     void reset_grid();  // explicitly clear chunk grid (occupants + velocities)
 
+    // Reload the physics compute shader from disk (recompiles velocity_spread.glsl
+    // and rebuilds the pipeline + uniform set). Safe to call at runtime; if the
+    // new shader fails to compile, the old one is kept. No-op if not in the tree.
+    void reload_physics_shader();
+    
+    Callable get_reload_physics_shader() const {
+        return callable_mp(const_cast<FluidParticleSystem *>(this), &FluidParticleSystem::reload_physics_shader);
+    }
+
     // Grid bounding box, used by the editor gizmo (plugin.gd)
     AABB  get_grid_aabb()  const {
         return AABB(Vector3(0,0,0), Vector3((float)grid_width,(float)grid_height,(float)grid_depth));
@@ -138,11 +147,11 @@ private:
     int   grid_depth      = 256;    // adepth
     int   num_particles   = 262144; // 100*100*100
     Vector3 gravity_vec   = Vector3(0, 0.1f, 0);  // gravity vector (world or local)
-    bool    gravity_local = true;   // if true, transformed by node basis into grid space
-    float surface_tension = 1.1f;   // surfaceTension
-    float water_viscosity = 1.0f;   // waterviscosity
-    float attraction_force = 1.0f;  // global multiplier on per-particle attraction/repulsion
-    int   neighbor_mode   = 7;      // 6+center (reference uses 7)
+    bool    gravity_local = false;   // if true, transformed by node basis into grid space
+    float surface_tension = 0.0f;   // surfaceTension
+    float water_viscosity = 0.0f;   // waterviscosity
+    float attraction_force = 0.1f;  // global multiplier on per-particle attraction/repulsion
+    int   neighbor_mode   = 15;      // 6+center (reference uses 7)
 
     // ── simulation toggle ───────────────────────────────────────────────────
     bool  simulation_active = true;
@@ -152,7 +161,7 @@ private:
     Vector3   initial_chunk_origin    = Vector3(2, 2, 2);
     Vector3i  initial_chunk_size      = Vector3i(64, 64, 64);
     Color     initial_chunk_color     = Color(1.0f, 1.0f, 1.0f, 1.0f);  // solid white
-    float     initial_chunk_attraction = 0.0f;  // solid particles have 0 attraction
+    float     initial_chunk_attraction = 1.0f;  // solid particles have 0 attraction
 
     // ── rendering ────────────────────────────────────────────────
     // A normal MeshInstance3D (render_node) rebuilds its ArrayMesh every frame
@@ -208,6 +217,8 @@ private:
     Vector3  pending_delta_origin;
     bool     delta_impulse_pending = false;
     Transform3D prev_global_transform;  // for computing node-movement impulses
+    Transform3D prev_delta_transform;  // for computing node-movement impulses
+    bool      has_prev_delta_transform = false;
     bool      has_prev_transform = false;
     bool      gpu_ready    = false;
 
@@ -228,6 +239,12 @@ private:
                            Vector3 delta_origin,
                            bool has_delta);
     void _dispatch_sortkey();
+
+    // Compile a .glsl compute shader resource into an RD shader RID.
+    // Uses CACHE_MODE_REPLACE so edits on disk are picked up.
+    RID _compile_compute_shader(const String &res_path);
+    // Build a single storage-buffer RDUniform (helper for uniform-set creation).
+    static Ref<RDUniform> _make_storage_uniform(RID buf, uint32_t binding);
 };
 
 }  // namespace godot

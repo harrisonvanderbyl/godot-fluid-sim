@@ -84,7 +84,7 @@ class FluidGizmoPlugin extends EditorNode3DGizmoPlugin:
 
 		# Rotation center marker (center of the grid)
 		var center := p + s * 0.5
-		var hsize := 0.15 * min(s.x, min(s.y, s.z))
+		var hsize := float(0.15 * min(s.x, min(s.y, s.z)))
 		var hlines := PackedVector3Array()
 		hlines.append(center - Vector3(hsize, 0, 0)); hlines.append(center + Vector3(hsize, 0, 0))
 		hlines.append(center - Vector3(0, hsize, 0)); hlines.append(center + Vector3(0, hsize, 0))

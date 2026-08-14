@@ -105,12 +105,21 @@ void FluidParticleSystem::_bind_methods() {
     ClassDB::bind_method(D_METHOD("set_render_material","v"),  &FluidParticleSystem::set_render_material);
     ClassDB::bind_method(D_METHOD("get_render_material"),       &FluidParticleSystem::get_render_material);
 
+    ClassDB::bind_method(D_METHOD("reload_physics_shader"), &FluidParticleSystem::reload_physics_shader);
+    ClassDB::bind_method(D_METHOD("get_reload_physics_shader"), &FluidParticleSystem::get_reload_physics_shader);
     // Shader paths group
     ADD_GROUP("Shaders", "");
     ADD_PROPERTY(PropertyInfo(Variant::STRING, "clear_shader_path",
         PROPERTY_HINT_FILE, "*.glsl"), "set_clear_shader_path",   "get_clear_shader_path");
     ADD_PROPERTY(PropertyInfo(Variant::STRING, "physics_shader_path",
         PROPERTY_HINT_FILE, "*.glsl"), "set_physics_shader_path", "get_physics_shader_path");
+    // Inspector button: recompiles velocity_spread.glsl and rebuilds the pipeline.
+    // PROPERTY_USAGE_BUTTON renders the property as a clickable button in the
+    // inspector; clicking it invokes the bound method (no getter needed).
+    ADD_PROPERTY(PropertyInfo(Variant::CALLABLE, "reload_physics_shader",
+            PROPERTY_HINT_TOOL_BUTTON, "Reload Physics Shader,Reload",
+            PROPERTY_USAGE_EDITOR),
+            "", "get_reload_physics_shader");
     ADD_PROPERTY(PropertyInfo(Variant::STRING, "sortkey_shader_path",
         PROPERTY_HINT_FILE, "*.glsl"), "set_sortkey_shader_path", "get_sortkey_shader_path");
     ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "render_material",
@@ -287,7 +296,7 @@ void FluidParticleSystem::_build_gpu_resources() {
                     for (int ix = 0; ix < initial_chunk_size.x && idx < num_particles; ix++, idx++) {
                         pp[idx] = Vector3(initial_chunk_origin.x + ix, initial_chunk_origin.y + iy, initial_chunk_origin.z + iz);
                         cp[idx] = solid_col;
-                        c0[idx*4 + 0] = water_viscosity;
+                        c0[idx*4 + 0] = initial_chunk_attraction;
                         c0[idx*4 + 1] = 1.0f;
                         c0[idx*4 + 2] = 0.0f;
                         c0[idx*4 + 3] = 0.0f;
@@ -369,30 +378,12 @@ void FluidParticleSystem::_build_gpu_resources() {
 
     // ── Load and compile compute shaders ─────────────────────────────────────
     // Loaded via Godot's resource system (imports .glsl -> RDShaderFile).
+    // CACHE_MODE_REPLACE ensures on-disk edits are picked up (used both here
+    // and by reload_physics_shader()).
 
-    // Load compute shaders via Godot's resource system (imports .glsl -> RDShaderFile)
-    auto compile_shader = [&](const String &res_path) -> RID {
-        Ref<RDShaderFile> sf = ResourceLoader::get_singleton()->load(res_path);
-        if (!sf.is_valid()) {
-            UtilityFunctions::printerr("FluidParticleSystem: cannot load shader resource: ", res_path);
-            return RID();
-        }
-        Ref<RDShaderSPIRV> spirv = sf->get_spirv();
-        if (!spirv.is_valid()) {
-            UtilityFunctions::printerr("FluidParticleSystem: no SPIR-V in: ", res_path);
-            return RID();
-        }
-        String err = spirv->get_stage_compile_error(RenderingDevice::SHADER_STAGE_COMPUTE);
-        if (!err.is_empty()) {
-            UtilityFunctions::printerr("FluidParticleSystem: shader error (", res_path, "):\n", err);
-            return RID();
-        }
-        return rd->shader_create_from_spirv(spirv);
-    };
-
-    clear_shader   = compile_shader(clear_shader_path);
-    physics_shader = compile_shader(physics_shader_path);
-    sortkey_shader = compile_shader(sortkey_shader_path);
+    clear_shader   = _compile_compute_shader(clear_shader_path);
+    physics_shader = _compile_compute_shader(physics_shader_path);
+    sortkey_shader = _compile_compute_shader(sortkey_shader_path);
 
     if (clear_shader.is_valid())   clear_pipeline   = rd->compute_pipeline_create(clear_shader);
     if (physics_shader.is_valid()) physics_pipeline = rd->compute_pipeline_create(physics_shader);
@@ -406,21 +397,12 @@ void FluidParticleSystem::_build_gpu_resources() {
     //   binding 3 → runnable_indices
     //   binding 4 → sort_keys
 
-    auto make_storage_uniform = [](RID buf, uint32_t binding) -> Ref<RDUniform> {
-        Ref<RDUniform> u;
-        u.instantiate();
-        u->set_uniform_type(RenderingDevice::UNIFORM_TYPE_STORAGE_BUFFER);
-        u->set_binding(binding);
-        u->add_id(buf);
-        return u;
-    };
-
     TypedArray<RDUniform> uniforms;
-    uniforms.append(make_storage_uniform(vertex_buf,   0));
-    uniforms.append(make_storage_uniform(attrib_buf,   1));
-    uniforms.append(make_storage_uniform(chunk_buf,    2));
-    uniforms.append(make_storage_uniform(runnable_buf, 3));
-    uniforms.append(make_storage_uniform(sort_key_buf, 4));
+    uniforms.append(_make_storage_uniform(vertex_buf,   0));
+    uniforms.append(_make_storage_uniform(attrib_buf,   1));
+    uniforms.append(_make_storage_uniform(chunk_buf,    2));
+    uniforms.append(_make_storage_uniform(runnable_buf, 3));
+    uniforms.append(_make_storage_uniform(sort_key_buf, 4));
 
     if (clear_shader.is_valid()) {
         clear_uniform_set   = rd->uniform_set_create(uniforms, clear_shader,   0);
@@ -493,86 +475,80 @@ void FluidParticleSystem::_rebuild_gpu_resources() {
 // ─────────────────────────────────────────────────────────────────────────────
 void FluidParticleSystem::_process(double delta) {
     if (!gpu_ready) return;
-
-    // Simulation can be paused from the editor. The render mesh already
-    // reflects the last GPU state, so there's nothing to do when paused.
     if (!simulation_active) return;
 
-    // ── Compute impulses from node movement ───────────────────────────────
-    // The fluid lives in the node's local (grid) space. When the node moves or
-    // rotates in the world, the fluid — which has its own momentum in grid
-    // space — should resist that motion as if it were a separate body.
+    // ── Assemble this frame's displacement FORCE ────────────────────────────
+    // The shader applies  dp = M*p + origin - p  and subtracts dp from momentum.
+    // For correct inertia dp must be a *force* (the frame-to-frame CHANGE in the
+    // container's displacement field), not the raw displacement — otherwise
+    // steady container motion keeps accelerating the fluid instead of letting it
+    // settle into a matching drift.
     //
-    // We compute the full delta transform: D = T_cur^-1 * T_prev.
-    // For a particle at grid position p, the point where it "would have been"
-    // (in the new grid space) is D(p) = D.basis * p + D.origin.
-    // The displacement is dp = D(p) - p. The shader subtracts dp from each
-    // particle's position, giving it inertia. This correctly handles:
-    //   - Pure translation (uniform shift)
-    //   - Rotation about the container center (tangential field)
-    //   - Rotation about an off-center point (swinging on a string)
-    //   - Any combination of translation + rotation
-    // Accumulate explicit rotational/transform impulses from script calls.
-    // add_velocity_impulse and add_rotational_impulse both compose into the
-    // delta transform (pending_delta_basis / pending_delta_origin).
-    Basis delta_basis = Basis();  // identity
-    Vector3 delta_origin = Vector3();
-    bool has_delta = false;
+    //   displacement field this frame : dispC(p) = (Bc - I)p + oc
+    //   displacement field last frame : dispP(p) = (Bp - I)p + op
+    //   container force = dispC - dispP           : (Bc - Bp)p + (oc - op)
+    //   explicit one-shot impulse (kick/stir)     : (Be - I)p + oe
+    //
+    // Solve  M*p + origin - p  ==  fContainer(p) + fImpulse(p)  for M, origin:
+    //   M      = I + (Bc - Bp) + (Be - I) = (Bc - Bp) + Be
+    //   origin = (oc - op) + oe
 
-    if (delta_impulse_pending) {
-        delta_basis = pending_delta_basis;
-        delta_origin = pending_delta_origin;
-        has_delta = true;
+    // 1. Raw container delta transform for THIS frame (frame-to-frame).
+    Transform3D cur_xform = get_global_transform();
+    Basis   Bc;               // identity by default (first frame)
+    Vector3 oc;
+    if (has_prev_transform) {
+        Transform3D delta_xform = prev_global_transform.affine_inverse() * cur_xform;
+        Bc = delta_xform.basis;
+        oc = delta_xform.origin;
+    }
+
+    // 2. Previous frame's container delta (differencing baseline). Falls back to
+    //    identity/zero so the first moving frame reads as pure acceleration.
+    Basis   Bp = has_prev_delta_transform ? prev_delta_transform.basis  : Basis();
+    Vector3 op = has_prev_delta_transform ? prev_delta_transform.origin : Vector3();
+
+    // 3. Explicit one-shot impulse (add_velocity_impulse / add_rotational_impulse).
+    //    Applied fresh this frame and NOT stored into prev_delta, so it isn't
+    //    subtracted back out next frame — a genuine impulse.
+    bool    had_impulse = delta_impulse_pending;
+    Basis   Be;               // identity if none pending
+    Vector3 oe;
+    if (had_impulse) {
+        Be = pending_delta_basis;
+        oe = pending_delta_origin;
         delta_impulse_pending = false;
     }
 
-    // Transform-delta impulse from node movement.
-    Transform3D cur_xform = get_global_transform();
-    if (has_prev_transform) {
-        // D = T_prev^-1 * T_cur — the container's forward motion.
-        // The shader computes dp = D(p) - p (how the container moved) and
-        // subtracts it, so particles resist the motion (inertia).
-        // affine_inverse handles scale; plain inverse assumes rotation only.
-        Transform3D delta_xform = prev_global_transform.affine_inverse() * cur_xform;
+    // 4. Assemble the force matrix M and origin (row-wise on the basis).
+    Basis M;
+    M.rows[0] = (Bc.rows[0] - Bp.rows[0]) + Be.rows[0];
+    M.rows[1] = (Bc.rows[1] - Bp.rows[1]) + Be.rows[1];
+    M.rows[2] = (Bc.rows[2] - Bp.rows[2]) + Be.rows[2];
+    Vector3 force_origin = (oc - op) + oe;
 
-        if (has_delta) {
-            // Compose: existing explicit delta * node-movement delta
-            delta_basis = delta_xform.basis * delta_basis;
-            delta_origin = delta_xform.basis.xform(delta_origin) + delta_xform.origin;
-        } else {
-            delta_basis = delta_xform.basis;
-            delta_origin = delta_xform.origin;
-        }
-        has_delta = true;
-    }
-    prev_global_transform = cur_xform;
-    has_prev_transform = true;
+    // A force exists if the container has history to difference against, or an
+    // explicit impulse was queued. Gravity is applied separately in the shader,
+    // so it does NOT gate has_delta.
+    bool has_delta = has_prev_transform || had_impulse;
 
-    // NOTE: No per-frame clear — the chunk grid stores persistent velocity state
-    // that is read-consumed by swap0() and re-written by atomic_plus_equals().
-    // Clearing every frame would zero all velocities and force firststep=true on
-    // every particle, breaking the simulation. The grid is initialized once at
-    // _build_gpu_resources() and only cleared explicitly via reset_grid().
+    // 5. Roll history forward. Store ONLY the raw container delta (Bc, oc) as
+    //    next frame's differencing baseline — never the impulse.
+    prev_global_transform    = cur_xform;
+    has_prev_transform       = true;
+    prev_delta_transform     = Transform3D(Bc, oc);
+    has_prev_delta_transform = true;
 
-    // 1. Physics step (velocity_spread.glsl)
-    _dispatch_physics(Vector3(), delta_basis, delta_origin, has_delta);
+    // ── Dispatch ────────────────────────────────────────────────────────────
+    // No per-frame chunk clear: the grid holds persistent pooled velocity.
+    _dispatch_physics(Vector3(), M, force_origin, has_delta);
 
-    // 2. Source/sink children dispatch into the same RD command buffer
     for (int i = 0; i < get_child_count(); i++) {
         FluidSourceBase *ss = Object::cast_to<FluidSourceBase>(get_child(i));
         if (ss) ss->dispatch_into_parent();
     }
 
-    // 3. Sort keys (every 60 frames)
-    if (frame_count % 60 == 0) {
-        _dispatch_sortkey();
-    }
-
-    // rd is the shared RenderingDevice (owned by RenderingServer) — we must
-    // NOT call submit()/sync() ourselves. The compute lists recorded above
-    // are submitted automatically as part of the engine's own frame, and the
-    // render mesh's vertex/attribute buffers are read directly by the
-    // renderer with no CPU round-trip.
+    if (frame_count % 60 == 0) _dispatch_sortkey();
     frame_count++;
 }
 
@@ -757,4 +733,101 @@ void FluidParticleSystem::reset_grid() {
     _dispatch_clear_grid();
     rd->submit();
     rd->sync();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Reload the physics compute shader from disk. Frees the old shader RID,
+// pipeline RID, and uniform set RID, then recompiles velocity_spread.glsl
+// (or whatever physics_shader_path currently points at) and rebuilds the
+// pipeline + uniform set against the existing storage buffers.
+//
+// Safe to call at runtime: if the new shader fails to compile, the old one
+// is kept and an error is printed. No-op if the node is not in the tree
+// (rd will be null).
+// ─────────────────────────────────────────────────────────────────────────────
+void FluidParticleSystem::reload_physics_shader() {
+    if (!rd) {
+        UtilityFunctions::printerr(
+            "FluidParticleSystem::reload_physics_shader: RenderingDevice not available "
+            "(node not in tree?).");
+        return;
+    }
+
+    // Compile the new shader FIRST so a compile failure leaves the old one intact.
+    RID new_shader = _compile_compute_shader(physics_shader_path);
+    if (!new_shader.is_valid()) {
+        UtilityFunctions::printerr(
+            "FluidParticleSystem::reload_physics_shader: new shader failed to compile; "
+            "keeping previous physics shader.");
+        return;
+    }
+
+    // Tear down the old physics shader's GPU resources.
+    if (physics_uniform_set.is_valid()) {
+        rd->free_rid(physics_uniform_set);
+        physics_uniform_set = RID();
+    }
+    if (physics_pipeline.is_valid()) {
+        rd->free_rid(physics_pipeline);
+        physics_pipeline = RID();
+    }
+    if (physics_shader.is_valid()) {
+        rd->free_rid(physics_shader);
+        physics_shader = RID();
+    }
+
+    // Install the new shader and rebuild the pipeline + uniform set against
+    // the same storage buffers the other pipelines use.
+    physics_shader   = new_shader;
+    physics_pipeline = rd->compute_pipeline_create(physics_shader);
+
+    TypedArray<RDUniform> uniforms;
+    uniforms.append(_make_storage_uniform(vertex_buf,   0));
+    uniforms.append(_make_storage_uniform(attrib_buf,   1));
+    uniforms.append(_make_storage_uniform(chunk_buf,    2));
+    uniforms.append(_make_storage_uniform(runnable_buf, 3));
+    uniforms.append(_make_storage_uniform(sort_key_buf, 4));
+    physics_uniform_set = rd->uniform_set_create(uniforms, physics_shader, 0);
+
+    UtilityFunctions::print(
+        "FluidParticleSystem: physics shader reloaded from ", physics_shader_path);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Load a .glsl compute shader resource and compile it into an RD shader RID.
+// Uses CACHE_MODE_REPLACE so on-disk edits are picked up on every call (this
+// matters for reload_physics_shader(); the initial build path also benefits
+// from bypassing any stale cache).
+// ─────────────────────────────────────────────────────────────────────────────
+RID FluidParticleSystem::_compile_compute_shader(const String &res_path) {
+    Ref<RDShaderFile> sf = ResourceLoader::get_singleton()->load(
+        res_path, "", ResourceLoader::CACHE_MODE_REPLACE);
+    if (!sf.is_valid()) {
+        UtilityFunctions::printerr("FluidParticleSystem: cannot load shader resource: ", res_path);
+        return RID();
+    }
+    Ref<RDShaderSPIRV> spirv = sf->get_spirv();
+    if (!spirv.is_valid()) {
+        UtilityFunctions::printerr("FluidParticleSystem: no SPIR-V in: ", res_path);
+        return RID();
+    }
+    String err = spirv->get_stage_compile_error(RenderingDevice::SHADER_STAGE_COMPUTE);
+    if (!err.is_empty()) {
+        UtilityFunctions::printerr("FluidParticleSystem: shader error (", res_path, "):\n", err);
+        return RID();
+    }
+    return rd->shader_create_from_spirv(spirv);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Build a single storage-buffer RDUniform. Static helper shared by the initial
+// build path and reload_physics_shader().
+// ─────────────────────────────────────────────────────────────────────────────
+Ref<RDUniform> FluidParticleSystem::_make_storage_uniform(RID buf, uint32_t binding) {
+    Ref<RDUniform> u;
+    u.instantiate();
+    u->set_uniform_type(RenderingDevice::UNIFORM_TYPE_STORAGE_BUFFER);
+    u->set_binding(binding);
+    u->add_id(buf);
+    return u;
 }

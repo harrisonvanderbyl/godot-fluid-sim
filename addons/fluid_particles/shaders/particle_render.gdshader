@@ -32,11 +32,11 @@ void vertex() {
 	float neighbors_filled = CUSTOM0.z;
 
 	// Kill invisible or fully-buried particles
-	//if (neighbors_filled < 0.5) {
-		//POSITION    = vec4(0.0);
-		//POINT_SIZE  = 0.0;
-	   //
-	//}
+	if (neighbors_filled < 1.5) {
+		POSITION    = vec4(0.0);
+		POINT_SIZE  = 0.0;
+	   
+	}
 
 	bool is_solid = (COLOR.a > (200.0 / 255.0));
 
@@ -46,7 +46,7 @@ void vertex() {
 	vec4  final_color = COLOR;
 
 	if (!is_solid) {
-		radius      = 1.0;
+		radius      = 0.5;
 		radius_grow = 0.0;
 		// Surface-coverage colour blend (liquid look)
 		float blend = 0.0f;//pow(1.0 - neighbors_filled / 15.0, 3.0);

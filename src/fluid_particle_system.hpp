@@ -103,8 +103,8 @@ public:
     Ref<ShaderMaterial> get_render_material() const;
 
     // Composite shader uniforms (Inspector-editable)
-    void set_blur_radius(float v);
-    float get_blur_radius() const { return blur_radius; }
+    void set_smooth_radius(float v);
+    float get_smooth_radius() const { return smooth_radius; }
     void set_tint_strength(float v);
     float get_tint_strength() const { return tint_strength; }
     void set_refraction_strength(float v);
@@ -113,8 +113,10 @@ public:
     float get_absorption_dist() const { return absorption_dist; }
     void set_fluid_tint(Color v);
     Color get_fluid_tint() const { return fluid_tint; }
-    void set_normal_smooth(float v);
-    float get_normal_smooth() const { return normal_smooth; }
+    void set_smooth_falloff(float v);
+    float get_smooth_falloff() const { return smooth_falloff; }
+    void set_coverage_threshold(float v);
+    float get_coverage_threshold() const { return coverage_threshold; }
 
     // Spawn helpers callable from GDScript
     void spawn_block(Vector3 origin, int w, int h, int d, Color color, float attraction);
@@ -256,12 +258,13 @@ private:
     bool      gpu_ready    = false;
 
     // ── composite shader uniforms (Inspector-editable) ───────────────────
-    float   blur_radius         = 2.0f;
+    float   smooth_radius       = 2.0f;
     float   tint_strength       = 0.6f;
     float   refraction_strength = 0.04f;
     float   absorption_dist     = 4.0f;
     Color   fluid_tint          = Color(0.7f, 0.85f, 1.0f);
-    float   normal_smooth       = 2.0f;
+    float   smooth_falloff      = 0.5f;
+    float   coverage_threshold  = 0.5f;
 
     // ── particle storage buffers ──────────────────────────────────────────────
     // Standalone storage buffers on the local device (not tied to any mesh).

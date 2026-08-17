@@ -10,13 +10,16 @@ uniform sampler2D fluid_depth_tex : filter_nearest, repeat_disable;
 uniform sampler2D screen_tex      : hint_screen_texture, filter_linear;
 uniform sampler2D depth_tex       : hint_depth_texture, filter_nearest, repeat_disable;
 
-uniform float blur_radius         = 2.0;
 uniform float tint_strength       = 0.6;
 uniform float refraction_strength = 0.04;
 uniform float absorption_dist     = 4.0;
 uniform vec3  fluid_tint          : source_color = vec3(0.7, 0.85, 1.0);
 uniform vec2  fluid_pixel_size    = vec2(0.001953, 0.001953);
-uniform float normal_smooth       = 2.0;  // depth smoothing radius for normals
+
+// Unified smoothing controls (replaces blur_radius + normal_smooth).
+uniform float smooth_radius       = 2.0;  // pixel step scale for the kernel
+uniform float smooth_falloff      = 0.5;  // radial gaussian sharpness (exp(-r2 * falloff))
+uniform float coverage_threshold  = 0.5;  // smoothed-coverage cutoff for the edge
 
 uniform float offscreen_far      = 100.0;
 uniform float offscreen_near     = 0.1;
@@ -33,20 +36,53 @@ vec3 world_from_fluid(vec2 uv, float d) {
     return (offscreen_inv_view * vp).xyz;
 }
 
-// Smoothed fluid depth at a UV (gaussian-weighted, only where fluid exists).
-float smoothed_fluid_depth(vec2 uv, float radius) {
-    vec2 px = fluid_pixel_size * radius;
-    float sum = 0.0; float wsum = 0.0;
+// ── Unified circular 5x5 smoothing ───────────────────────────────────────────
+// Every tap in the kernel participates (on- AND off-droplet). Color and depth
+// are premultiplied by coverage and normalized by the coverage-weighted sum, so
+// empty taps don't bleed black color or far-plane depth into the average — they
+// only pull down `coverage`, which drives the soft edge. Radius^2 <= 4 keeps the
+// kernel circular (drops the corners); exp(-r2 * falloff) is the radial dropoff.
+void smooth_fluid(vec2 uv, out vec3 color, out float depth, out float coverage) {
+    vec2  px   = fluid_pixel_size * smooth_radius;
+    float wsum = 0.0;
+    float asum = 0.0;
+    float dsum = 0.0;
+    vec3  csum = vec3(0.0);
     for (int j = -2; j <= 2; j++)
     for (int i = -2; i <= 2; i++) {
-        vec2 ouv = uv + vec2(float(i), float(j)) * px;
-        if (texture(fluid_tex, ouv).a < 0.5) continue;
-        float d = texture(fluid_depth_tex, ouv).r;
-        float w = exp(-float(i*i + j*j) * 0.5);
-        sum += d * w;
-        wsum += w;
+        float r2 = float(i*i + j*j);
+        if (r2 > 4.0) continue;                    // circular mask
+        float rw  = exp(-r2 * smooth_falloff);     // radial dropoff
+        vec2  ouv = uv + vec2(float(i), float(j)) * px;
+        vec4  s   = texture(fluid_tex, ouv);
+        float d   = texture(fluid_depth_tex, ouv).r;
+        wsum += rw;
+        asum += s.a * rw;
+        csum += s.rgb * s.a * rw;
+        dsum += d     * s.a * rw;
     }
-    return (wsum > 0.0001) ? sum / wsum : texture(fluid_depth_tex, uv).r;
+    coverage = (wsum > 0.0001) ? asum / wsum : 0.0;
+    color    = (asum > 0.0001) ? csum / asum : vec3(0.0);
+    depth    = (asum > 0.0001) ? dsum / asum : texture(fluid_depth_tex, uv).r;
+}
+
+// Depth-only version of the same kernel (for the normal finite differences).
+float smooth_fluid_depth(vec2 uv) {
+    vec2  px   = fluid_pixel_size * smooth_radius;
+    float asum = 0.0;
+    float dsum = 0.0;
+    for (int j = -2; j <= 2; j++)
+    for (int i = -2; i <= 2; i++) {
+        float r2 = float(i*i + j*j);
+        if (r2 > 4.0) continue;
+        float rw  = exp(-r2 * smooth_falloff);
+        vec2  ouv = uv + vec2(float(i), float(j)) * px;
+        vec4  s   = texture(fluid_tex, ouv);
+        float d   = texture(fluid_depth_tex, ouv).r;
+        asum += s.a * rw;
+        dsum += d * s.a * rw;
+    }
+    return (asum > 0.0001) ? dsum / asum : texture(fluid_depth_tex, uv).r;
 }
 
 void vertex() {
@@ -55,26 +91,21 @@ void vertex() {
 }
 
 void fragment() {
-    // Sample the fluid color (3x3 average for blur) and depth (nearest, not
-    // averaged — averaging depth across edges causes artifacts).
-    vec2 px = fluid_pixel_size * blur_radius;
-    vec3 col = vec3(0.0); float fd = 0.0; float w = 0.0;
-    float fd_center = texture(fluid_depth_tex, v_uv).r;
-    for (float j = -1.0; j <= 1.0; j+=0.25)
-    for (float i = -1.0; i <= 1.0; i+=0.25) {
-        vec2 ouv = v_uv + vec2(float(i), float(j)) * px;
-        float present = texture(fluid_tex, ouv).a;
-        if (present < 0.5) continue;
-        col += texture(fluid_tex, ouv).rgb;
-        w   += 1.0;
-    }
-    if (w < 0.5) discard;
-    col /= w;
-    fd  = fd_center;
+    // Single smoothing pass: color and depth come out of the same circular 5x5
+    // radial kernel, with all pixels (on/off droplet) participating.
+    vec3  col;
+    float fd;
+    float coverage;
+    smooth_fluid(v_uv, col, fd, coverage);
 
-    // Fluid depth is standard-Z (0=near, 1=far). Reconstruct the fluid
-    // surface world position, then reproject through the MAIN camera's
-    // PROJECTION_MATRIX * VIEW_MATRIX to get a DEPTH value that exactly
+    // Presence test AFTER the smooth kernel. Off-droplet taps have lowered the
+    // coverage near the boundary, giving a soft anti-aliased edge instead of the
+    // old hard per-tap cutoff.
+    if (coverage < coverage_threshold) discard;
+
+    // Fluid depth is standard-Z (0=near, 1=far). Reconstruct the fluid surface
+    // world position from the SMOOTHED depth, then reproject through the MAIN
+    // camera's PROJECTION_MATRIX * VIEW_MATRIX to get a DEPTH value that exactly
     // matches the scene depth buffer format.
     vec2 ndc = v_uv * 2.0 - 1.0;
     vec4 view_pos = offscreen_inv_proj * vec4(ndc, fd, 1.0);
@@ -88,18 +119,17 @@ void fragment() {
     // Main scene depth at this pixel (NDC [0,1], same format).
     float scene_ndc_z = textureLod(depth_tex, SCREEN_UV, 0.0).r;
 
-    // If the scene geometry is closer than the fluid, discard — let the
-    // scene show through. (Reverse-Z: higher = closer.)
+    // If the scene geometry is closer than the fluid, discard — let the scene
+    // show through. (Reverse-Z: higher = closer.) Also after the kernel.
     if (scene_ndc_z > fluid_ndc_z) discard;
 
     // ── Depth-based normal reconstruction ────────────────────────────────────
-    // Sample smoothed depth at neighbors and reconstruct world positions,
-    // then build a normal via cross product of the surface tangents.
-    vec2 npx = fluid_pixel_size * normal_smooth;
-    float d_r = smoothed_fluid_depth(v_uv + vec2(npx.x, 0.0), normal_smooth);
-    float d_l = smoothed_fluid_depth(v_uv - vec2(npx.x, 0.0), normal_smooth);
-    float d_u = smoothed_fluid_depth(v_uv + vec2(0.0, npx.y), normal_smooth);
-    float d_d = smoothed_fluid_depth(v_uv - vec2(0.0, npx.y), normal_smooth);
+    // Neighbors use the same smoothing kernel as the center.
+    vec2 npx = fluid_pixel_size * smooth_radius;
+    float d_r = smooth_fluid_depth(v_uv + vec2(npx.x, 0.0));
+    float d_l = smooth_fluid_depth(v_uv - vec2(npx.x, 0.0));
+    float d_u = smooth_fluid_depth(v_uv + vec2(0.0, npx.y));
+    float d_d = smooth_fluid_depth(v_uv - vec2(0.0, npx.y));
 
     vec3 w_r = world_from_fluid(v_uv + vec2(npx.x, 0.0), d_r);
     vec3 w_l = world_from_fluid(v_uv - vec2(npx.x, 0.0), d_l);

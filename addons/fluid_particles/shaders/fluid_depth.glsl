@@ -56,7 +56,7 @@ layout(location = 3) flat out vec3  v_cam_pos;
 void main() {
     float neighbors_filled = in_custom0.z;
     bool  is_solid    = (in_color.a > (200.0 / 255.0));
-    float radius      = is_solid ? 1.125 : 1.5;
+    float radius      = is_solid ? 1.125 : 2.5;
     float radius_grow = is_solid ? 0.125 : 0.0;
     radius = max(radius + neighbors_filled * radius_grow, 0.0);
 

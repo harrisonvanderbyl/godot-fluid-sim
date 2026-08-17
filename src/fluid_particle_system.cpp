@@ -121,8 +121,8 @@ void FluidParticleSystem::_bind_methods() {
     ClassDB::bind_method(D_METHOD("get_sortkey_shader_path"),      &FluidParticleSystem::get_sortkey_shader_path);
     ClassDB::bind_method(D_METHOD("set_render_material","v"),  &FluidParticleSystem::set_render_material);
     ClassDB::bind_method(D_METHOD("get_render_material"),       &FluidParticleSystem::get_render_material);
-    ClassDB::bind_method(D_METHOD("set_blur_radius","v"),          &FluidParticleSystem::set_blur_radius);
-    ClassDB::bind_method(D_METHOD("get_blur_radius"),               &FluidParticleSystem::get_blur_radius);
+    ClassDB::bind_method(D_METHOD("set_smooth_radius","v"),        &FluidParticleSystem::set_smooth_radius);
+    ClassDB::bind_method(D_METHOD("get_smooth_radius"),             &FluidParticleSystem::get_smooth_radius);
     ClassDB::bind_method(D_METHOD("set_tint_strength","v"),       &FluidParticleSystem::set_tint_strength);
     ClassDB::bind_method(D_METHOD("get_tint_strength"),            &FluidParticleSystem::get_tint_strength);
     ClassDB::bind_method(D_METHOD("set_refraction_strength","v"), &FluidParticleSystem::set_refraction_strength);
@@ -131,8 +131,10 @@ void FluidParticleSystem::_bind_methods() {
     ClassDB::bind_method(D_METHOD("get_absorption_dist"),          &FluidParticleSystem::get_absorption_dist);
     ClassDB::bind_method(D_METHOD("set_fluid_tint","v"),          &FluidParticleSystem::set_fluid_tint);
     ClassDB::bind_method(D_METHOD("get_fluid_tint"),               &FluidParticleSystem::get_fluid_tint);
-    ClassDB::bind_method(D_METHOD("set_normal_smooth","v"),       &FluidParticleSystem::set_normal_smooth);
-    ClassDB::bind_method(D_METHOD("get_normal_smooth"),            &FluidParticleSystem::get_normal_smooth);
+    ClassDB::bind_method(D_METHOD("set_smooth_falloff","v"),      &FluidParticleSystem::set_smooth_falloff);
+    ClassDB::bind_method(D_METHOD("get_smooth_falloff"),           &FluidParticleSystem::get_smooth_falloff);
+    ClassDB::bind_method(D_METHOD("set_coverage_threshold","v"),   &FluidParticleSystem::set_coverage_threshold);
+    ClassDB::bind_method(D_METHOD("get_coverage_threshold"),        &FluidParticleSystem::get_coverage_threshold);
 
     ClassDB::bind_method(D_METHOD("reload_physics_shader"), &FluidParticleSystem::reload_physics_shader);
     ClassDB::bind_method(D_METHOD("get_reload_physics_shader"), &FluidParticleSystem::get_reload_physics_shader);
@@ -183,22 +185,23 @@ void FluidParticleSystem::_bind_methods() {
 
     // Composite shader uniforms group.
     ADD_GROUP("Composite", "composite_");
-    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "composite_blur_radius",         PROPERTY_HINT_RANGE, "0,10,0.01"),  "set_blur_radius",          "get_blur_radius");
+    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "composite_smooth_radius",       PROPERTY_HINT_RANGE, "0,10,0.01"),  "set_smooth_radius",       "get_smooth_radius");
     ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "composite_tint_strength",       PROPERTY_HINT_RANGE, "0,2,0.01"),   "set_tint_strength",        "get_tint_strength");
     ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "composite_refraction_strength", PROPERTY_HINT_RANGE, "0,0.2,0.001"),"set_refraction_strength",  "get_refraction_strength");
     ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "composite_absorption_dist",     PROPERTY_HINT_RANGE, "0,20,0.01"),  "set_absorption_dist",      "get_absorption_dist");
     ADD_PROPERTY(PropertyInfo(Variant::COLOR, "composite_tint",                PROPERTY_HINT_COLOR_NO_ALPHA),      "set_fluid_tint",           "get_fluid_tint");
-    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "composite_normal_smooth",       PROPERTY_HINT_RANGE, "0,10,0.01"),  "set_normal_smooth",        "get_normal_smooth");
+    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "composite_smooth_falloff",      PROPERTY_HINT_RANGE, "0,5,0.01"),   "set_smooth_falloff",      "get_smooth_falloff");
+    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "composite_coverage_threshold",   PROPERTY_HINT_RANGE, "0,1,0.01"),   "set_coverage_threshold",  "get_coverage_threshold");
     ADD_GROUP("", "");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Composite uniform setters — push to the active composite material.
 // ─────────────────────────────────────────────────────────────────────────────
-void FluidParticleSystem::set_blur_radius(float v) {
-    blur_radius = v;
+void FluidParticleSystem::set_smooth_radius(float v) {
+    smooth_radius = v;
     Ref<ShaderMaterial> comp = _active_composite_material();
-    if (comp.is_valid()) comp->set_shader_parameter("blur_radius", v);
+    if (comp.is_valid()) comp->set_shader_parameter("smooth_radius", v);
 }
 void FluidParticleSystem::set_tint_strength(float v) {
     tint_strength = v;
@@ -220,10 +223,15 @@ void FluidParticleSystem::set_fluid_tint(Color v) {
     Ref<ShaderMaterial> comp = _active_composite_material();
     if (comp.is_valid()) comp->set_shader_parameter("fluid_tint", v);
 }
-void FluidParticleSystem::set_normal_smooth(float v) {
-    normal_smooth = v;
+void FluidParticleSystem::set_smooth_falloff(float v) {
+    smooth_falloff = v;
     Ref<ShaderMaterial> comp = _active_composite_material();
-    if (comp.is_valid()) comp->set_shader_parameter("normal_smooth", v);
+    if (comp.is_valid()) comp->set_shader_parameter("smooth_falloff", v);
+}
+void FluidParticleSystem::set_coverage_threshold(float v) {
+    coverage_threshold = v;
+    Ref<ShaderMaterial> comp = _active_composite_material();
+    if (comp.is_valid()) comp->set_shader_parameter("coverage_threshold", v);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -261,12 +269,13 @@ void FluidParticleSystem::set_render_material(const Ref<ShaderMaterial> &v) {
             render_material->set_shader_parameter("fluid_depth_tex", rd_depth_tex_2d);
         }
         // Push all composite uniform values from node properties.
-        render_material->set_shader_parameter("blur_radius", blur_radius);
+        render_material->set_shader_parameter("smooth_radius", smooth_radius);
         render_material->set_shader_parameter("tint_strength", tint_strength);
         render_material->set_shader_parameter("refraction_strength", refraction_strength);
         render_material->set_shader_parameter("absorption_dist", absorption_dist);
         render_material->set_shader_parameter("fluid_tint", fluid_tint);
-        render_material->set_shader_parameter("normal_smooth", normal_smooth);
+        render_material->set_shader_parameter("smooth_falloff", smooth_falloff);
+        render_material->set_shader_parameter("coverage_threshold", coverage_threshold);
     }
 
     // The user-facing material is the COMPOSITE material (the one that draws
@@ -586,12 +595,13 @@ void FluidParticleSystem::_ensure_rd_render_pipeline() {
     composite_material->set_shader_parameter("offscreen_near", 0.1);
 
     // Push initial composite uniform values from the node properties.
-    composite_material->set_shader_parameter("blur_radius", blur_radius);
+    composite_material->set_shader_parameter("smooth_radius", smooth_radius);
     composite_material->set_shader_parameter("tint_strength", tint_strength);
     composite_material->set_shader_parameter("refraction_strength", refraction_strength);
     composite_material->set_shader_parameter("absorption_dist", absorption_dist);
     composite_material->set_shader_parameter("fluid_tint", fluid_tint);
-    composite_material->set_shader_parameter("normal_smooth", normal_smooth);
+    composite_material->set_shader_parameter("smooth_falloff", smooth_falloff);
+    composite_material->set_shader_parameter("coverage_threshold", coverage_threshold);
 
     // Fullscreen quad mesh — a 2-triangle quad in NDC, the vertex shader writes
     // POSITION directly so it covers the whole screen regardless of camera.

@@ -50,6 +50,7 @@ public:
     void set_grid_width(int v);     int get_grid_width()     const { return grid_width; }
     void set_grid_height(int v);    int get_grid_height()    const { return grid_height; }
     void set_grid_depth(int v);     int get_grid_depth()     const { return grid_depth; }
+    void set_grid_size(Vector3i v); Vector3i get_grid_size() const { return Vector3i(grid_width, grid_height, grid_depth); }
     void set_num_particles(int v);  int get_num_particles()  const { return num_particles; }
 
     // Rebuild all GPU resources (buffers, pipelines, render mesh) after a
@@ -66,6 +67,10 @@ public:
     float get_attraction_force()    const { return attraction_force; }
     void set_neighbor_mode(int v)   { neighbor_mode = (v >= 15 ? 15 : 6); }
     int  get_neighbor_mode()        const { return neighbor_mode; }
+    void set_max_occupancy(int v)   { max_occupancy = v; }
+    int  get_max_occupancy()        const { return max_occupancy; }
+    void set_back_pressure(float v) { back_pressure = v; }
+    float get_back_pressure()       const { return back_pressure; }
 
     // Simulation toggle
     void set_simulation_active(bool v) { simulation_active = v; }
@@ -179,6 +184,8 @@ private:
     float water_viscosity = 0.0f;   // waterviscosity
     float attraction_force = 0.1f;  // global multiplier on per-particle attraction/repulsion
     int   neighbor_mode   = 15;      // 6+center (reference uses 7)
+    int   max_occupancy   = 1;       // max liquid particles per grid cell
+    float back_pressure   = 0.0f;    // outward bias as a cell fills
 
     // ── simulation toggle ───────────────────────────────────────────────────
     bool  simulation_active = true;

@@ -46,7 +46,8 @@ struct PushConstants {
     int32_t color_offset_words;
     int32_t custom0_offset_words;
     float   has_delta;       // 1.0 if delta transform is non-identity
-    float   _pad0, _pad1;
+    int32_t max_occupancy;  // max liquid particles per grid cell
+    float   back_pressure;   // outward bias as a cell fills
     // Delta transform as 3 vec4 rows (row-major 3x4 matrix):
     //   row0 = (m00, m01, m02, origin_x)
     //   row1 = (m10, m11, m12, origin_y)
@@ -68,6 +69,8 @@ void FluidParticleSystem::_bind_methods() {
     ClassDB::bind_method(D_METHOD("get_grid_height"),       &FluidParticleSystem::get_grid_height);
     ClassDB::bind_method(D_METHOD("set_grid_depth","v"),    &FluidParticleSystem::set_grid_depth);
     ClassDB::bind_method(D_METHOD("get_grid_depth"),        &FluidParticleSystem::get_grid_depth);
+    ClassDB::bind_method(D_METHOD("set_grid_size","v"),    &FluidParticleSystem::set_grid_size);
+    ClassDB::bind_method(D_METHOD("get_grid_size"),         &FluidParticleSystem::get_grid_size);
     ClassDB::bind_method(D_METHOD("set_num_particles","v"), &FluidParticleSystem::set_num_particles);
     ClassDB::bind_method(D_METHOD("get_num_particles"),     &FluidParticleSystem::get_num_particles);
     ClassDB::bind_method(D_METHOD("set_gravity","v"),       &FluidParticleSystem::set_gravity);
@@ -82,6 +85,10 @@ void FluidParticleSystem::_bind_methods() {
     ClassDB::bind_method(D_METHOD("get_attraction_force"),     &FluidParticleSystem::get_attraction_force);
     ClassDB::bind_method(D_METHOD("set_neighbor_mode","v"), &FluidParticleSystem::set_neighbor_mode);
     ClassDB::bind_method(D_METHOD("get_neighbor_mode"),     &FluidParticleSystem::get_neighbor_mode);
+    ClassDB::bind_method(D_METHOD("set_max_occupancy","v"), &FluidParticleSystem::set_max_occupancy);
+    ClassDB::bind_method(D_METHOD("get_max_occupancy"),      &FluidParticleSystem::get_max_occupancy);
+    ClassDB::bind_method(D_METHOD("set_back_pressure","v"), &FluidParticleSystem::set_back_pressure);
+    ClassDB::bind_method(D_METHOD("get_back_pressure"),      &FluidParticleSystem::get_back_pressure);
     ClassDB::bind_method(D_METHOD("set_simulation_active","v"), &FluidParticleSystem::set_simulation_active);
     ClassDB::bind_method(D_METHOD("get_simulation_active"),     &FluidParticleSystem::get_simulation_active);
     ClassDB::bind_method(D_METHOD("set_use_initial_chunk","v"), &FluidParticleSystem::set_use_initial_chunk);
@@ -129,25 +136,44 @@ void FluidParticleSystem::_bind_methods() {
 
     ClassDB::bind_method(D_METHOD("reload_physics_shader"), &FluidParticleSystem::reload_physics_shader);
     ClassDB::bind_method(D_METHOD("get_reload_physics_shader"), &FluidParticleSystem::get_reload_physics_shader);
-    // Shader paths group
+
+    // ── Inspector layout ───────────────────────────────────────────────────
+    // Reload button at the top for quick iteration.
     ADD_GROUP("Shaders", "");
-    ADD_PROPERTY(PropertyInfo(Variant::STRING, "clear_shader_path",
-        PROPERTY_HINT_FILE, "*.glsl"), "set_clear_shader_path",   "get_clear_shader_path");
-    ADD_PROPERTY(PropertyInfo(Variant::STRING, "physics_shader_path",
-        PROPERTY_HINT_FILE, "*.glsl"), "set_physics_shader_path", "get_physics_shader_path");
-    // Inspector button: recompiles velocity_spread.glsl and rebuilds the pipeline.
-    // PROPERTY_USAGE_BUTTON renders the property as a clickable button in the
-    // inspector; clicking it invokes the bound method (no getter needed).
     ADD_PROPERTY(PropertyInfo(Variant::CALLABLE, "reload_physics_shader",
             PROPERTY_HINT_TOOL_BUTTON, "Reload Physics Shader,Reload",
             PROPERTY_USAGE_EDITOR),
             "", "get_reload_physics_shader");
+
+    // Compute shader paths.
+    ADD_PROPERTY(PropertyInfo(Variant::STRING, "clear_shader_path",
+        PROPERTY_HINT_FILE, "*.glsl"), "set_clear_shader_path",   "get_clear_shader_path");
+    ADD_PROPERTY(PropertyInfo(Variant::STRING, "physics_shader_path",
+        PROPERTY_HINT_FILE, "*.glsl"), "set_physics_shader_path", "get_physics_shader_path");
     ADD_PROPERTY(PropertyInfo(Variant::STRING, "sortkey_shader_path",
         PROPERTY_HINT_FILE, "*.glsl"), "set_sortkey_shader_path", "get_sortkey_shader_path");
-    ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "render_material",
+    // Composite material — when set, pre-fills with fluid_composite.gdshader
+    // so the user can edit the composite shader code + uniforms in the inspector.
+    ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "composite_material",
         PROPERTY_HINT_RESOURCE_TYPE, "ShaderMaterial"), "set_render_material", "get_render_material");
+    ADD_GROUP("", "");
 
-    // Initial chunk fill group
+    // Simulation parameters.
+    ADD_GROUP("Simulation", "sim_");
+    ADD_PROPERTY(PropertyInfo(Variant::BOOL,  "sim_active"), "set_simulation_active", "get_simulation_active");
+    ADD_PROPERTY(PropertyInfo(Variant::VECTOR3I, "sim_grid_size"), "set_grid_size", "get_grid_size");
+    ADD_PROPERTY(PropertyInfo(Variant::INT,   "sim_num_particles"),   "set_num_particles",   "get_num_particles");
+    ADD_PROPERTY(PropertyInfo(Variant::VECTOR3, "sim_gravity"),         "set_gravity",         "get_gravity");
+    ADD_PROPERTY(PropertyInfo(Variant::BOOL,    "sim_gravity_local"),   "set_gravity_local",   "get_gravity_local");
+    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "sim_surface_tension"), "set_surface_tension", "get_surface_tension");
+    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "sim_water_viscosity"), "set_water_viscosity", "get_water_viscosity");
+    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "sim_attraction_force", PROPERTY_HINT_RANGE, "-2,2,0.01"), "set_attraction_force", "get_attraction_force");
+    ADD_PROPERTY(PropertyInfo(Variant::INT,   "sim_neighbor_mode"),   "set_neighbor_mode",   "get_neighbor_mode");
+    ADD_PROPERTY(PropertyInfo(Variant::INT,   "sim_max_occupancy"),   "set_max_occupancy",   "get_max_occupancy");
+    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "sim_back_pressure",   PROPERTY_HINT_RANGE, "0,2,0.01"), "set_back_pressure", "get_back_pressure");
+    ADD_GROUP("", "");
+
+    // Initial chunk fill group.
     ADD_GROUP("Initial Chunk", "initial_chunk_");
     ADD_PROPERTY(PropertyInfo(Variant::BOOL,     "initial_chunk_use"),                             "set_use_initial_chunk",        "get_use_initial_chunk");
     ADD_PROPERTY(PropertyInfo(Variant::VECTOR3,  "initial_chunk_origin"),                          "set_initial_chunk_origin",     "get_initial_chunk_origin");
@@ -155,6 +181,7 @@ void FluidParticleSystem::_bind_methods() {
     ADD_PROPERTY(PropertyInfo(Variant::COLOR,    "initial_chunk_color"),                           "set_initial_chunk_color",      "get_initial_chunk_color");
     ADD_PROPERTY(PropertyInfo(Variant::FLOAT,    "initial_chunk_attraction", PROPERTY_HINT_RANGE, "-2,2,0.01"), "set_initial_chunk_attraction", "get_initial_chunk_attraction");
 
+    // Composite shader uniforms group.
     ADD_GROUP("Composite", "composite_");
     ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "composite_blur_radius",         PROPERTY_HINT_RANGE, "0,10,0.01"),  "set_blur_radius",          "get_blur_radius");
     ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "composite_tint_strength",       PROPERTY_HINT_RANGE, "0,2,0.01"),   "set_tint_strength",        "get_tint_strength");
@@ -162,21 +189,7 @@ void FluidParticleSystem::_bind_methods() {
     ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "composite_absorption_dist",     PROPERTY_HINT_RANGE, "0,20,0.01"),  "set_absorption_dist",      "get_absorption_dist");
     ADD_PROPERTY(PropertyInfo(Variant::COLOR, "composite_tint",                PROPERTY_HINT_COLOR_NO_ALPHA),      "set_fluid_tint",           "get_fluid_tint");
     ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "composite_normal_smooth",       PROPERTY_HINT_RANGE, "0,10,0.01"),  "set_normal_smooth",        "get_normal_smooth");
-
     ADD_GROUP("", "");
-
-    ADD_PROPERTY(PropertyInfo(Variant::INT,   "grid_width"),      "set_grid_width",      "get_grid_width");
-    ADD_PROPERTY(PropertyInfo(Variant::INT,   "grid_height"),     "set_grid_height",     "get_grid_height");
-    ADD_PROPERTY(PropertyInfo(Variant::INT,   "grid_depth"),      "set_grid_depth",      "get_grid_depth");
-    ADD_PROPERTY(PropertyInfo(Variant::INT,   "num_particles"),   "set_num_particles",   "get_num_particles");
-    ADD_PROPERTY(PropertyInfo(Variant::VECTOR3, "gravity"),         "set_gravity",         "get_gravity");
-    ADD_PROPERTY(PropertyInfo(Variant::BOOL,    "gravity_local"),   "set_gravity_local",   "get_gravity_local");
-    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_tension"), "set_surface_tension", "get_surface_tension");
-    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "water_viscosity"), "set_water_viscosity", "get_water_viscosity");
-    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "attraction_force", PROPERTY_HINT_RANGE, "-2,2,0.01"), "set_attraction_force", "get_attraction_force");
-    ADD_PROPERTY(PropertyInfo(Variant::INT,   "neighbor_mode"),   "set_neighbor_mode",   "get_neighbor_mode");
-    ADD_PROPERTY(PropertyInfo(Variant::BOOL,  "simulation_active"), "set_simulation_active", "get_simulation_active");
-
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -217,29 +230,13 @@ void FluidParticleSystem::set_normal_smooth(float v) {
 void FluidParticleSystem::set_grid_width(int v)   { grid_width  = v; _rebuild_gpu_resources(); }
 void FluidParticleSystem::set_grid_height(int v)  { grid_height = v; _rebuild_gpu_resources(); }
 void FluidParticleSystem::set_grid_depth(int v)   { grid_depth  = v; _rebuild_gpu_resources(); }
+void FluidParticleSystem::set_grid_size(Vector3i v) {
+    grid_width = v.x; grid_height = v.y; grid_depth = v.z;
+    _rebuild_gpu_resources();
+}
 void FluidParticleSystem::set_num_particles(int v){ num_particles = v; _rebuild_gpu_resources(); }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Default render shader path. Used to pre-fill the render_shader resource when
-// it has not been set (or has been cleared) in the inspector.
-// ─────────────────────────────────────────────────────────────────────────────
-static const char *DEFAULT_RENDER_SHADER_PATH =
-    "res://addons/fluid_particles/shaders/particle_render.gdshader";
-
-// Loads the default particle render shader code into a new Shader resource.
-static Ref<Shader> _load_default_render_shader() {
-    Ref<Shader> shader;
-    shader.instantiate();
-    Ref<FileAccess> sf = FileAccess::open(DEFAULT_RENDER_SHADER_PATH, FileAccess::READ);
-    if (sf.is_valid()) {
-        shader->set_code(sf->get_as_text());
-    } else {
-        UtilityFunctions::printerr("FluidParticleSystem: cannot open default render shader: ",
-                                    DEFAULT_RENDER_SHADER_PATH);
-    }
-    return shader;
-}
-
 void FluidParticleSystem::set_render_material(const Ref<ShaderMaterial> &v) {
     render_material = v;
 
@@ -263,6 +260,13 @@ void FluidParticleSystem::set_render_material(const Ref<ShaderMaterial> &v) {
         if (rd_depth_tex_2d.is_valid()) {
             render_material->set_shader_parameter("fluid_depth_tex", rd_depth_tex_2d);
         }
+        // Push all composite uniform values from node properties.
+        render_material->set_shader_parameter("blur_radius", blur_radius);
+        render_material->set_shader_parameter("tint_strength", tint_strength);
+        render_material->set_shader_parameter("refraction_strength", refraction_strength);
+        render_material->set_shader_parameter("absorption_dist", absorption_dist);
+        render_material->set_shader_parameter("fluid_tint", fluid_tint);
+        render_material->set_shader_parameter("normal_smooth", normal_smooth);
     }
 
     // The user-facing material is the COMPOSITE material (the one that draws
@@ -281,7 +285,6 @@ Ref<ShaderMaterial> FluidParticleSystem::get_render_material() const {
     return render_material;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // ─────────────────────────────────────────────────────────────────────────────
 // Build the RD offscreen render pipeline:
 //   FluidParticleSystem (this)
@@ -1440,6 +1443,8 @@ void FluidParticleSystem::_dispatch_physics(Vector3 global_add_velocity,
     pc.color_offset_words   = color_offset_words;
     pc.custom0_offset_words = custom0_offset_words;
     pc.has_delta        = has_delta ? 1.0f : 0.0f;
+    pc.max_occupancy    = max_occupancy;
+    pc.back_pressure    = back_pressure;
     // Pack 3x3 basis + origin into 3 vec4 rows (row-major):
     //   row0 = (m00, m01, m02, origin_x)
     //   row1 = (m10, m11, m12, origin_y)

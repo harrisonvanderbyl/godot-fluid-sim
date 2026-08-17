@@ -18,14 +18,10 @@ layout(push_constant, std430) uniform PushConstants {
     int   color_offset_words;
     int   custom0_offset_words;
     float has_delta;
-    //int   max_occupancy;     // ← NEW: max liquid particles per cell (solids stay 1)
-    //float back_pressure;     // ← NEW: outward bias strength as a cell fills
-    //float _pad1;
+    int   max_occupancy;     // max liquid particles per cell (solids stay 1)
+    float back_pressure;     // outward bias strength as a cell fills
     vec4  delta_row[3];
 } pc;
-
-const int max_occupancy = 1;
-const float back_pressure = 0.0;
 
 
 // occupant is now a REPRESENTATIVE (last successful joiner) used only for the
@@ -145,7 +141,7 @@ void main() {
     if (opacity_fade < 1.0) opacity_fade += 1.0 / 60.0;
 
     bool me_solid = ((color_packed >> 24) & 0xffu) > 200u;
-    int  my_cap   = me_solid ? 1 : max_occupancy;   // solids never share
+    int  my_cap   = me_solid ? 1 : pc.max_occupancy;   // solids never share
 
     // Container rigid-body impulse (inertia vs container motion).
     vec3 container_force = vec3(0.0);
@@ -222,7 +218,7 @@ void main() {
 
     momentum -= pc.gravity; // assumed to be included in container force
     momentum += cohesion * pc.surface_tension;   // surface tension: pull toward the mass
-    momentum += crowd    * back_pressure;     // pressure: push out of crowded cells
+    momentum += crowd    * pc.back_pressure;     // pressure: push out of crowded cells
 
     // Isolation damping: lone particles bleed speed so the surface stays crisp.
     //float isolation = 1.0 - clamp(neighbors_filled / float(n_size), 0.0, 1.0);

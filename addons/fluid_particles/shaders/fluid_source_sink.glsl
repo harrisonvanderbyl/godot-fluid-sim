@@ -36,13 +36,15 @@ layout(push_constant, std430) uniform PushConstants {
     int   custom0_offset_words;
 } pc;
 
+// MUST match ChunkCell in velocity_spread.glsl (std430, 32 bytes).
 struct ChunkCell {
-    int  occupant;
+    int  occupant;      // representative particle idx, or -1 if empty
     uint vel_x_bits;
     uint vel_y_bits;
     uint vel_z_bits;
     uint vel_w_bits;
-    uint _pad[3];
+    int  count;         // current occupancy
+    uint _pad[2];
 };
 
 layout(set = 0, binding = 0, std430) buffer VertexBuffer { float vtx[]; };
@@ -71,8 +73,31 @@ int cell_index(ivec3 p) {
     return p.x + p.y * pc.grid_w + p.z * pc.grid_w * pc.grid_h;
 }
 
+// Claim an empty cell for a newly-spawned particle. Mirrors the join half of
+// cell_try_join from velocity_spread.glsl: set occupant, then increment count.
 bool cell_try_place(int cidx, int pidx) {
-    return atomicCompSwap(cells[cidx].occupant, -1, pidx) == -1;
+    if (atomicCompSwap(cells[cidx].occupant, -1, pidx) != -1) return false;
+    atomicAdd(cells[cidx].count, 1);
+    return true;
+}
+
+// Release a cell from a sunk particle. Mirrors cell_leave from
+// velocity_spread.glsl (decrement count, clear representative if the cell
+// empties) and additionally drains the pooled velocity field so orphaned
+// momentum doesn't create a ghost puff toward the now-empty cell on the next
+// physics step.
+void cell_leave_and_drain(int cidx) {
+    int after = atomicAdd(cells[cidx].count, -1) - 1;
+    if (after <= 0) {
+        // Cell is empty — clear the representative occupant (CAS against the
+        // current value, matching cell_leave in velocity_spread.glsl).
+        atomicCompSwap(cells[cidx].occupant, cells[cidx].occupant, -1);
+        // Drain the pooled velocity so a neighbor doesn't harvest a velocity
+        // spike from an empty cell next frame.
+        atomicExchange(cells[cidx].vel_x_bits, 0u);
+        atomicExchange(cells[cidx].vel_y_bits, 0u);
+        atomicExchange(cells[cidx].vel_z_bits, 0u);
+    }
 }
 
 // Shared atomic counter — how many particles we've claimed/released this dispatch
@@ -151,12 +176,12 @@ void main() {
         int slot = atomicAdd(s_claimed, 1);
         if (slot >= pc.max_count) return;
 
-        // Free the grid cell so other particles can move into it.
-        // Only clear if we still own this cell — avoids evicting a neighbor
-        // that may have swapped in during the physics step.
+        // Free the grid cell so other particles can move into the vacated
+        // location: decrement count, clear the representative occupant if the
+        // cell empties, and drain the pooled velocity field.
         ivec3 cell_pos = ivec3(round(get_position(int(gid))));
         int   cidx     = cell_index(cell_pos);
-        atomicCompSwap(cells[cidx].occupant, int(gid), -1);
+        cell_leave_and_drain(cidx);
 
         set_inactive(int(gid));
     }

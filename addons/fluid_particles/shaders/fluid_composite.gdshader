@@ -146,10 +146,10 @@ void fragment() {
     vec3 screen_col = textureLod(screen_tex, refract_uv, 0.0).rgb;
 
     // Thickness from NDC depth difference.
-    float thickness = max(fluid_ndc_z - scene_ndc_z, 0.0);
+    float thickness = max(scene_ndc_z - fluid_ndc_z, 0.0);
     float tint = tint_strength * exp(-thickness / max(absorption_dist, 0.001));
 
-    ALBEDO = mix(screen_col, screen_col * fluid_tint + col, tint);
+    ALBEDO = mix(screen_col, screen_col * col, tint);
     ALPHA = 1.0;
 
     // Write the reprojected fluid depth (matches scene depth buffer format).

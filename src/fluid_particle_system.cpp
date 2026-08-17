@@ -235,6 +235,27 @@ void FluidParticleSystem::set_coverage_threshold(float v) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Shader path setters — hot-reload the corresponding compute shader when the
+// path changes while the node is in the tree. If the new shader fails to
+// compile, the old one is kept and an error is printed.
+// ─────────────────────────────────────────────────────────────────────────────
+void FluidParticleSystem::set_clear_shader_path(const String &v) {
+    if (clear_shader_path == v) return;
+    clear_shader_path = v;
+    if (is_inside_tree()) _reload_compute_shader(0);
+}
+void FluidParticleSystem::set_physics_shader_path(const String &v) {
+    if (physics_shader_path == v) return;
+    physics_shader_path = v;
+    if (is_inside_tree()) _reload_compute_shader(1);
+}
+void FluidParticleSystem::set_sortkey_shader_path(const String &v) {
+    if (sortkey_shader_path == v) return;
+    sortkey_shader_path = v;
+    if (is_inside_tree()) _reload_compute_shader(2);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 void FluidParticleSystem::set_grid_width(int v)   { grid_width  = v; _rebuild_gpu_resources(); }
 void FluidParticleSystem::set_grid_height(int v)  { grid_height = v; _rebuild_gpu_resources(); }
 void FluidParticleSystem::set_grid_depth(int v)   { grid_depth  = v; _rebuild_gpu_resources(); }
@@ -1216,6 +1237,11 @@ void FluidParticleSystem::_destroy_gpu_resources() {
     if (!rd) return;
     gpu_ready = false;
 
+    // Sync any in-flight GPU work before freeing resources. Without this,
+    // freeing uniform sets / pipelines / buffers still referenced by a pending
+    // command buffer can corrupt the device.
+    _sync_rd();
+
     // ── RD render pipeline resources ────────────────────────────────────────
     if (rd_color_tex_2d.is_valid()) rd_color_tex_2d->set_texture_rd_rid(RID());
     if (rd_depth_tex_2d.is_valid()) rd_depth_tex_2d->set_texture_rd_rid(RID());
@@ -1286,10 +1312,7 @@ void FluidParticleSystem::_rebuild_gpu_resources() {
 void FluidParticleSystem::_process(double delta) {
     // Wait for the previous frame's GPU work to complete before starting new
     // work. The local device only allows one pending submission at a time.
-    if (rd && rd_submitted) {
-        rd->sync();
-        rd_submitted = false;
-    }
+    _sync_rd();
 
     // Sync the RD render pipeline to the main camera (resize textures, push
     // composite uniforms, position the composite quad). This must run BEFORE
@@ -1572,50 +1595,95 @@ void FluidParticleSystem::reset_grid() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Reload the physics compute shader from disk. Frees the old shader RID,
-// pipeline RID, and uniform set RID, then recompiles velocity_spread.glsl
-// (or whatever physics_shader_path currently points at) and rebuilds the
-// pipeline + uniform set against the existing storage buffers.
-//
-// Safe to call at runtime: if the new shader fails to compile, the old one
-// is kept and an error is printed. No-op if the node is not in the tree
-// (rd will be null).
+// Sync pending GPU work on the local device. Must be called before freeing any
+// RD resource that might still be referenced by an in-flight command buffer
+// (uniform sets, pipelines, shaders, buffers, textures). No-op if rd is null
+// or nothing has been submitted.
 // ─────────────────────────────────────────────────────────────────────────────
-void FluidParticleSystem::reload_physics_shader() {
+void FluidParticleSystem::_sync_rd() {
+    if (rd && rd_submitted) {
+        rd->sync();
+        rd_submitted = false;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Reload a single compute shader by index:
+//   0 = clear, 1 = physics, 2 = sortkey
+// Syncs the GPU, compiles the new shader from disk, tears down the old
+// uniform_set → pipeline → shader (in that dependency order), then rebuilds
+// them against the existing storage buffers. On compile failure the old
+// shader is kept and an error is printed. No-op if rd is not available.
+// ─────────────────────────────────────────────────────────────────────────────
+void FluidParticleSystem::_reload_compute_shader(int which) {
     if (!rd) {
         UtilityFunctions::printerr(
-            "FluidParticleSystem::reload_physics_shader: RenderingDevice not available "
-            "(node not in tree?).");
+            "FluidParticleSystem::_reload_compute_shader: RenderingDevice not "
+            "available (node not in tree?).");
         return;
     }
 
-    // Compile the new shader FIRST so a compile failure leaves the old one intact.
-    RID new_shader = _compile_compute_shader(physics_shader_path);
+    // Pick the path + RID/pipeline/uniform-set slots for this shader.
+    const String *path   = nullptr;
+    RID          *p_shader       = nullptr;
+    RID          *p_pipeline     = nullptr;
+    RID          *p_uniform_set  = nullptr;
+    const char   *name = "?";
+    switch (which) {
+        case 0:
+            path = &clear_shader_path;   p_shader = &clear_shader;
+            p_pipeline = &clear_pipeline; p_uniform_set = &clear_uniform_set;
+            name = "clear";   break;
+        case 1:
+            path = &physics_shader_path; p_shader = &physics_shader;
+            p_pipeline = &physics_pipeline; p_uniform_set = &physics_uniform_set;
+            name = "physics"; break;
+        case 2:
+            path = &sortkey_shader_path; p_shader = &sortkey_shader;
+            p_pipeline = &sortkey_pipeline; p_uniform_set = &sortkey_uniform_set;
+            name = "sortkey"; break;
+        default:
+            UtilityFunctions::printerr(
+                "FluidParticleSystem::_reload_compute_shader: invalid index ", which);
+            return;
+    }
+
+    // 1. Sync any in-flight GPU work that may reference the resources we're
+    //    about to free. Without this, freeing a uniform set / pipeline that's
+    //    still bound in a pending command buffer can corrupt the device.
+    _sync_rd();
+
+    // 2. Compile the new shader FIRST so a compile failure leaves the old one
+    //    intact. _compile_compute_shader uses CACHE_MODE_REPLACE so on-disk
+    //    edits are picked up.
+    RID new_shader = _compile_compute_shader(*path);
     if (!new_shader.is_valid()) {
         UtilityFunctions::printerr(
-            "FluidParticleSystem::reload_physics_shader: new shader failed to compile; "
-            "keeping previous physics shader.");
+            "FluidParticleSystem::_reload_compute_shader: new ", name,
+            " shader failed to compile; keeping previous shader.");
         return;
     }
 
-    // Tear down the old physics shader's GPU resources.
-    if (physics_uniform_set.is_valid()) {
-        rd->free_rid(physics_uniform_set);
-        physics_uniform_set = RID();
+    // 3. Tear down the old resources in dependency order: uniform set first
+    //    (references pipeline + shader), then pipeline (references shader),
+    //    then shader.
+    if (p_uniform_set->is_valid()) {
+        rd->free_rid(*p_uniform_set);
+        *p_uniform_set = RID();
     }
-    if (physics_pipeline.is_valid()) {
-        rd->free_rid(physics_pipeline);
-        physics_pipeline = RID();
+    if (p_pipeline->is_valid()) {
+        rd->free_rid(*p_pipeline);
+        *p_pipeline = RID();
     }
-    if (physics_shader.is_valid()) {
-        rd->free_rid(physics_shader);
-        physics_shader = RID();
+    if (p_shader->is_valid()) {
+        rd->free_rid(*p_shader);
+        *p_shader = RID();
     }
 
-    // Install the new shader and rebuild the pipeline + uniform set against
-    // the same storage buffers the other pipelines use.
-    physics_shader   = new_shader;
-    physics_pipeline = rd->compute_pipeline_create(physics_shader);
+    // 4. Install the new shader and rebuild the pipeline + uniform set against
+    //    the same storage buffers all three pipelines share.
+    *p_shader   = new_shader;
+    *p_pipeline = rd->compute_pipeline_create(*p_shader);
 
     TypedArray<RDUniform> uniforms;
     uniforms.append(_make_storage_uniform(vertex_buf,   0));
@@ -1623,10 +1691,18 @@ void FluidParticleSystem::reload_physics_shader() {
     uniforms.append(_make_storage_uniform(chunk_buf,    2));
     uniforms.append(_make_storage_uniform(runnable_buf, 3));
     uniforms.append(_make_storage_uniform(sort_key_buf, 4));
-    physics_uniform_set = rd->uniform_set_create(uniforms, physics_shader, 0);
+    *p_uniform_set = rd->uniform_set_create(uniforms, *p_shader, 0);
 
     UtilityFunctions::print(
-        "FluidParticleSystem: physics shader reloaded from ", physics_shader_path);
+        "FluidParticleSystem: ", name, " shader reloaded from ", *path);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public reload entry point — kept for the Inspector "Reload Physics Shader"
+// tool button and GDScript callers. Delegates to the generalized helper.
+// ─────────────────────────────────────────────────────────────────────────────
+void FluidParticleSystem::reload_physics_shader() {
+    _reload_compute_shader(1);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

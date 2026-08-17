@@ -88,12 +88,13 @@ public:
     void set_initial_chunk_attraction(float v) { initial_chunk_attraction = v; }
     float get_initial_chunk_attraction() const { return initial_chunk_attraction; }
 
-    // Shader paths (Inspector-editable, default to addon)
-    void   set_clear_shader_path(const String &v)  { clear_shader_path = v; }
+    // Shader paths (Inspector-editable, default to addon). Setting a new path
+    // hot-reloads the corresponding compute shader if the node is in the tree.
+    void   set_clear_shader_path(const String &v);
     String get_clear_shader_path()  const { return clear_shader_path; }
-    void   set_physics_shader_path(const String &v) { physics_shader_path = v; }
+    void   set_physics_shader_path(const String &v);
     String get_physics_shader_path() const { return physics_shader_path; }
-    void   set_sortkey_shader_path(const String &v) { sortkey_shader_path = v; }
+    void   set_sortkey_shader_path(const String &v);
     String get_sortkey_shader_path() const { return sortkey_shader_path; }
     // Render material resource. If null, uses the addon's particle_render.gdshader
     // internally (not editable). If set in the inspector with an empty shader, the
@@ -324,6 +325,13 @@ private:
     void _build_gpu_resources();
     void _destroy_gpu_resources();
     void _rebuild_gpu_resources();
+    // Sync pending GPU work on the local device (no-op if nothing submitted).
+    void _sync_rd();
+    // Reload a single compute shader by index: 0=clear, 1=physics, 2=sortkey.
+    // Syncs the GPU, compiles the new shader, tears down the old pipeline/
+    // uniform_set/shader (in that order), and rebuilds them. On compile failure
+    // the old shader is kept.
+    void _reload_compute_shader(int which);
     void _dispatch_clear_grid();
     void _dispatch_physics(Vector3 global_add_velocity,
                            const Basis &delta_basis,

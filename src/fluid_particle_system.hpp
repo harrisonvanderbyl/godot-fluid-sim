@@ -4,9 +4,15 @@
 #include <godot_cpp/classes/rd_shader_file.hpp>
 #include <godot_cpp/classes/rd_uniform.hpp>
 #include <godot_cpp/classes/mesh_instance3d.hpp>
-#include <godot_cpp/classes/array_mesh.hpp>
 #include <godot_cpp/classes/shader_material.hpp>
 #include <godot_cpp/classes/shader.hpp>
+#include <godot_cpp/classes/camera3d.hpp>
+#include <godot_cpp/classes/texture2drd.hpp>
+#include <godot_cpp/classes/scene_tree.hpp>
+#include <godot_cpp/classes/window.hpp>
+#include <godot_cpp/classes/viewport.hpp>
+#include <godot_cpp/classes/rendering_server.hpp>
+#include <godot_cpp/classes/engine.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 #include <godot_cpp/variant/packed_byte_array.hpp>
 #include <godot_cpp/variant/packed_float32_array.hpp>
@@ -91,6 +97,20 @@ public:
     void   set_render_material(const Ref<ShaderMaterial> &v);
     Ref<ShaderMaterial> get_render_material() const;
 
+    // Composite shader uniforms (Inspector-editable)
+    void set_blur_radius(float v);
+    float get_blur_radius() const { return blur_radius; }
+    void set_tint_strength(float v);
+    float get_tint_strength() const { return tint_strength; }
+    void set_refraction_strength(float v);
+    float get_refraction_strength() const { return refraction_strength; }
+    void set_absorption_dist(float v);
+    float get_absorption_dist() const { return absorption_dist; }
+    void set_fluid_tint(Color v);
+    Color get_fluid_tint() const { return fluid_tint; }
+    void set_normal_smooth(float v);
+    float get_normal_smooth() const { return normal_smooth; }
+
     // Spawn helpers callable from GDScript
     void spawn_block(Vector3 origin, int w, int h, int d, Color color, float attraction);
     void add_velocity_impulse(Vector3 impulse);
@@ -141,6 +161,13 @@ private:
     // Internal default material, created when render_material is null.
     Ref<ShaderMaterial> internal_material;
 
+    // Replace the raw cached pointer's validation strategy with an ObjectID.
+    // Keep main_camera_cache if you like, but add:
+    ObjectID main_camera_id;
+
+    Camera3D          *_resolve_main_camera();
+    Ref<ShaderMaterial> _active_composite_material() const;
+
     // ── simulation parameters (matching particles.cpp reference) ──────────
     int   grid_width      = 256;    // awidth
     int   grid_height     = 256;    // aheight
@@ -163,21 +190,22 @@ private:
     Color     initial_chunk_color     = Color(1.0f, 1.0f, 1.0f, 1.0f);  // solid white
     float     initial_chunk_attraction = 1.0f;  // solid particles have 0 attraction
 
-    // ── rendering ────────────────────────────────────────────────
-    // A normal MeshInstance3D (render_node) rebuilds its ArrayMesh every frame
-    // from a CPU readback of particle_buf, shaded by particle_render.gdshader
-    // (real ray-sphere/liquid rendering). See _update_render_mesh().
-
     // ── RenderingDevice compute pipeline ────────────────────────
     // Shared RenderingDevice (RenderingServer's main device) — required so
     // buffer RIDs fetched via mesh_surface_get_vertex_buffer_rd_rid()/
     // mesh_surface_get_attribute_buffer_rd_rid() can be bound directly in our
     // own compute pipelines (RIDs are not portable across separate
-    // RenderingDevice instances, so a local device would not work here).
-    RenderingDevice *rd = nullptr;
+    // ── RenderingDevice compute pipeline ────────────────────────
+    // A LOCAL RenderingDevice (created via create_local_rendering_device) that
+    // we fully control. All compute + render pipelines run on this device, so
+    // we can call submit()/sync() without conflicting with Godot's render
+    // thread. The output color+depth textures are shared to the shared device
+    // (via texture_create_from_extension) so the composite shader can sample them.
+    RenderingDevice *rd = nullptr;          // local device (compute + render)
+    RenderingDevice *shared_rd = nullptr;   // shared device (for compositor textures)
 
-    // GPU buffers (RIDs). Position/color/custom0 live inside the render
-    // mesh's own vertex/attribute storage buffers (see _ensure_render_node).
+    // GPU buffers (RIDs on the local device). Created as standalone storage
+    // buffers — not tied to any mesh.
     RID vertex_buf;
     RID attrib_buf;
     RID chunk_buf;
@@ -185,9 +213,7 @@ private:
     RID sort_key_buf;
 
     // Byte-stride/offset (in 4-byte words) describing how particle data is
-    // packed inside vertex_buf/attrib_buf. Computed once from the mesh's
-    // array format via RenderingServer::mesh_surface_get_format_*, and passed
-    // to every compute shader via push constants.
+    // packed inside vertex_buf/attrib_buf. Fixed layout (not from mesh format).
     int vertex_stride_floats  = 3;
     int attrib_stride_words   = 0;
     int color_offset_words    = 0;
@@ -222,14 +248,69 @@ private:
     bool      has_prev_transform = false;
     bool      gpu_ready    = false;
 
-    // ── render mesh ──────────────────────────────────────────────────────────
-    // Created once (not rebuilt per frame): a persistent ArrayMesh whose
-    // vertex/attribute storage buffers are written to directly by the compute
-    // shaders. See _ensure_render_node().
-    MeshInstance3D  *render_node  = nullptr;
-    Ref<ArrayMesh>   render_mesh;
+    // ── composite shader uniforms (Inspector-editable) ───────────────────
+    float   blur_radius         = 2.0f;
+    float   tint_strength       = 0.6f;
+    float   refraction_strength = 0.04f;
+    float   absorption_dist     = 4.0f;
+    Color   fluid_tint          = Color(0.7f, 0.85f, 1.0f);
+    float   normal_smooth       = 2.0f;
 
-    void _ensure_render_node();
+    // ── particle storage buffers ──────────────────────────────────────────────
+    // Standalone storage buffers on the local device (not tied to any mesh).
+    // vertex_buf: vec3 position per particle (stride 12 bytes)
+    // attrib_buf: vec4 color + vec4 custom0 per particle (stride 32 bytes)
+    // Written by compute shaders, read by the RD render pipeline.
+
+    // ── RD offscreen render pipeline ─────────────────────────────────────────
+    // Particles are rendered directly via a RenderingDevice render pipeline
+    // into an RD framebuffer with a color attachment (RGBA8: rgb=color, a=1)
+    // and a depth attachment (D32_SFLOAT). The output textures are shared to
+    // the shared device and exposed to the composite shader via Texture2DRD.
+    //
+    // The composite quad (composite_node) is a MeshInstance3D with a spatial
+    // shader that samples the color+depth textures and blurs/refracts/tints
+    // the screen. It is parented to the main camera so it's always in frustum.
+    MeshInstance3D  *composite_node     = nullptr;
+    Ref<ShaderMaterial> composite_material;
+    Ref<Shader>         composite_shader;     // fluid_composite.gdshader
+    Camera3D        *main_camera_cache = nullptr;  // resolved each frame from the SceneTree
+
+    // RD render pipeline resources (created in _ensure_rd_render_pipeline).
+    // All on the local device (rd) except the shared-device texture wrappers.
+    RID     rd_render_shader;       // shader RID (vertex+fragment SPIR-V)
+    RID     rd_render_pipeline;     // render pipeline RID
+    RID     rd_camera_ubo;          // uniform buffer for camera matrices
+    RID     rd_render_uniform_set;  // uniform set (camera UBO at binding 0)
+    RID     rd_color_tex;           // RGBA8 color attachment (local device)
+    RID     rd_depth_tex;           // D32_SFLOAT depth attachment (local device)
+    RID     rd_framebuffer;         // framebuffer (color + depth, local device)
+    int64_t rd_framebuffer_format = -1;  // cached framebuffer format ID
+    RID     rd_vertex_array;        // vertex array wrapping local storage buffers
+    int64_t rd_vertex_format   = -1;     // cached vertex format ID
+    Vector2i rd_vp_size;                // current offscreen texture size
+
+    // Shared-device texture wrappers (so the composite shader can sample them).
+    RID     shared_color_tex;       // shared-device view of rd_color_tex
+    RID     shared_depth_tex;       // shared-device view of rd_depth_tex
+
+    // Texture2DRD wrappers so the composite shader can sample the RD textures.
+    Ref<Texture2DRD> rd_color_tex_2d;
+    Ref<Texture2DRD> rd_depth_tex_2d;
+
+    // Per-frame data prepared on the main thread, consumed by the draw.
+    PackedByteArray rd_ubo_bytes;       // camera UBO data (updated each frame)
+    PackedByteArray rd_pc_bytes;        // push constant data (updated each frame)
+    bool rd_submitted = false;          // true after submit(), cleared by sync()
+
+    void _ensure_rd_render_pipeline();
+    void _sync_rd_viewport_size();
+    void _render_particles_rd();
+    void _sync_offscreen_camera();
+    // Recursively collect all Viewport descendants of `node` into `out`.
+    // Used to find the editor's 3D viewport in editor mode.
+    static void _collect_viewports(Node *node, TypedArray<Viewport> &out);
+
     void _build_gpu_resources();
     void _destroy_gpu_resources();
     void _rebuild_gpu_resources();

@@ -117,9 +117,6 @@ void fragment() {
 	vec4 upos = INV_PROJECTION_MATRIX * vec4(SCREEN_UV * 2.0 - 1.0, depth, 1.0);
 	// Write correct sphere depth
 	vec4 clip_hit = PROJECTION_MATRIX * VIEW_MATRIX * vec4(hit, 1.0);
-	//if((clip_hit.z / clip_hit.w) * 0.5 + 0.5 > depth){
-		//discard;
-	//}
 	
 	DEPTH = (clip_hit.z / clip_hit.w) ;
 	

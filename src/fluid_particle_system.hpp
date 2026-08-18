@@ -20,6 +20,8 @@
 #include <godot_cpp/variant/packed_vector3_array.hpp>
 #include <godot_cpp/variant/packed_color_array.hpp>
 
+#include <vector>
+
 namespace godot {
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -33,6 +35,28 @@ struct GPUChunkCell {
 
 // ──────────────────────────────────────────────────────────────────────────────
 // FluidParticleSystem — main node
+//
+// GPU resource lifetime, in one place:
+//
+//   _ensure_device()          creates the local RenderingDevice ONCE and keeps
+//                             it across rebuilds. create_local_rendering_device
+//                             transfers ownership to us, so it is memdelete'd
+//                             exactly once, in _shutdown_gpu().
+//
+//   _build_gpu_resources()    simulation buffers + compute pipelines. Bumps
+//                             gpu_generation so child sources know their cached
+//                             RIDs are stale.
+//
+//   _ensure_rd_render_pipeline()  render shader, vertex array, render targets,
+//                             camera UBO, pipeline, composite node. Idempotent
+//                             and self-cleaning on every failure path.
+//
+//   _destroy_gpu_resources()  releases everything but KEEPS the device. This is
+//                             what a rebuild uses.
+//
+//   _shutdown_gpu()           _destroy_gpu_resources + drain the deferred queue
+//                             + destroy the device. Idempotent; called from
+//                             _exit_tree, NOTIFICATION_PREDELETE and ~dtor.
 // ──────────────────────────────────────────────────────────────────────────────
 class FluidParticleSystem : public Node3D {
     GDCLASS(FluidParticleSystem, Node3D)
@@ -53,7 +77,7 @@ public:
     void set_grid_size(Vector3i v); Vector3i get_grid_size() const { return Vector3i(grid_width, grid_height, grid_depth); }
     void set_num_particles(int v);  int get_num_particles()  const { return num_particles; }
 
-    // Rebuild all GPU resources (buffers, pipelines, render mesh) after a
+    // Rebuild all GPU resources (buffers, pipelines, render targets) after a
     // property change that affects buffer sizes. No-op if not in the tree.
     void set_gravity(Vector3 v)    { gravity_vec = v; }
     Vector3 get_gravity()           const { return gravity_vec; }
@@ -96,10 +120,10 @@ public:
     String get_physics_shader_path() const { return physics_shader_path; }
     void   set_sortkey_shader_path(const String &v);
     String get_sortkey_shader_path() const { return sortkey_shader_path; }
-    // Render material resource. If null, uses the addon's particle_render.gdshader
-    // internally (not editable). If set in the inspector with an empty shader, the
-    // default particle render code is copied in so the user can edit code + uniforms
-    // per-instance. Edits to the shader or uniform values reflect instantly.
+    // Composite material resource. If null, an internal material built from
+    // fluid_composite.gdshader is used. If set in the inspector with an empty
+    // shader, the default composite code is copied in so the user can edit code
+    // + uniforms per-instance. Edits reflect instantly.
     void   set_render_material(const Ref<ShaderMaterial> &v);
     Ref<ShaderMaterial> get_render_material() const;
 
@@ -129,9 +153,19 @@ public:
     // and rebuilds the pipeline + uniform set). Safe to call at runtime; if the
     // new shader fails to compile, the old one is kept. No-op if not in the tree.
     void reload_physics_shader();
-    
+
     Callable get_reload_physics_shader() const {
         return callable_mp(const_cast<FluidParticleSystem *>(this), &FluidParticleSystem::reload_physics_shader);
+    }
+
+    // Reload the render (vertex+fragment) shader from disk and rebuild the
+    // render pipeline + uniform set. Use this after editing fluid_depth.glsl,
+    // including changes that alter the pipeline. On compile failure the current
+    // shader is kept and rendering continues.
+    void reload_render_shader();
+
+    Callable get_reload_render_shader() const {
+        return callable_mp(const_cast<FluidParticleSystem *>(this), &FluidParticleSystem::reload_render_shader);
     }
 
     // Grid bounding box, used by the editor gizmo (plugin.gd)
@@ -140,11 +174,17 @@ public:
     }
 
     // ── Access for child source/sink nodes ────────────────────────────────
-    // These expose the render mesh's own vertex/attribute RD storage buffers
-    // (bindings for position and color/custom0, respectively) plus the chunk
-    // grid, so FluidSource / FluidSink can dispatch their own compute shaders
-    // directly against the same buffers the renderer reads — no CPU round-trip.
+    // These expose our vertex/attribute RD storage buffers (position and
+    // color/custom0, respectively) plus the chunk grid, so FluidSource /
+    // FluidSink can dispatch their own compute shaders directly against the
+    // same buffers the renderer reads — no CPU round-trip.
+    //
+    // is_gpu_ready() and get_gpu_generation() let a child detect that we tore
+    // down and rebuilt underneath it. Any child holding RIDs built against an
+    // older generation must drop them before dispatching again.
     RenderingDevice *get_rd()             const { return rd; }
+    bool             is_gpu_ready()       const { return gpu_ready; }
+    uint64_t         get_gpu_generation() const { return gpu_generation; }
     RID              get_vertex_buf()     const { return vertex_buf; }
     RID              get_attribute_buf()  const { return attrib_buf; }
     RID              get_chunk_buf()      const { return chunk_buf; }
@@ -159,28 +199,34 @@ public:
 protected:
     static void _bind_methods();
 
+    // Fires on NOTIFICATION_PREDELETE whether or not the node ever entered the
+    // tree, and whether or not _exit_tree ran. No `override` — godot-cpp's
+    // GDCLASS detects this by name, it is not a virtual on Object.
+    void _notification(int p_what);
+
 private:
     // ── shader paths (Inspector-editable) ────────────────────────────────
     String clear_shader_path   = "res://addons/fluid_particles/shaders/clear_grid.glsl";
     String physics_shader_path = "res://addons/fluid_particles/shaders/velocity_spread.glsl";
     String sortkey_shader_path = "res://addons/fluid_particles/shaders/depth_sort_key.glsl";
-    // User-facing ShaderMaterial property. null → use internal_material (default).
+    // User-facing ShaderMaterial property. null → use composite_material.
     Ref<ShaderMaterial> render_material;
-    // Internal default material, created when render_material is null.
-    Ref<ShaderMaterial> internal_material;
 
-    // Replace the raw cached pointer's validation strategy with an ObjectID.
-    // Keep main_camera_cache if you like, but add:
+    // Main camera resolved by ObjectID so a freed camera can never be
+    // dereferenced — the ID goes stale and we re-resolve.
     ObjectID main_camera_id;
 
     Camera3D          *_resolve_main_camera();
     Ref<ShaderMaterial> _active_composite_material() const;
+    // Push every node-owned composite uniform onto a material. One place to
+    // edit when a uniform is added.
+    void                _push_composite_uniforms(const Ref<ShaderMaterial> &mat) const;
 
-    // ── simulation parameters (matching particles.cpp reference) ──────────
+    // ── simulation parameters ─────────────────────────────────────────────
     int   grid_width      = 256;    // awidth
     int   grid_height     = 256;    // aheight
     int   grid_depth      = 256;    // adepth
-    int   num_particles   = 262144; // 100*100*100
+    int   num_particles   = 262144;
     Vector3 gravity_vec   = Vector3(0, 0.1f, 0);  // gravity vector (world or local)
     bool    gravity_local = false;   // if true, transformed by node basis into grid space
     float surface_tension = 0.0f;   // surfaceTension
@@ -193,43 +239,44 @@ private:
     // ── simulation toggle ───────────────────────────────────────────────────
     bool  simulation_active = true;
 
-    // ── initial chunk fill (matching particles.cpp reference spawn) ────────
+    // ── initial chunk fill ─────────────────────────────────────────────────
     bool      use_initial_chunk       = true;
     Vector3   initial_chunk_origin    = Vector3(2, 2, 2);
     Vector3i  initial_chunk_size      = Vector3i(64, 64, 64);
     Color     initial_chunk_color     = Color(1.0f, 1.0f, 1.0f, 1.0f);  // solid white
-    float     initial_chunk_attraction = 1.0f;  // solid particles have 0 attraction
+    float     initial_chunk_attraction = 1.0f;
 
-    // ── RenderingDevice compute pipeline ────────────────────────
-    // Shared RenderingDevice (RenderingServer's main device) — required so
-    // buffer RIDs fetched via mesh_surface_get_vertex_buffer_rd_rid()/
-    // mesh_surface_get_attribute_buffer_rd_rid() can be bound directly in our
-    // own compute pipelines (RIDs are not portable across separate
-    // ── RenderingDevice compute pipeline ────────────────────────
+    // ── RenderingDevice ─────────────────────────────────────────────────────
     // A LOCAL RenderingDevice (created via create_local_rendering_device) that
     // we fully control. All compute + render pipelines run on this device, so
     // we can call submit()/sync() without conflicting with Godot's render
     // thread. The output color+depth textures are shared to the shared device
     // (via texture_create_from_extension) so the composite shader can sample them.
+    //
+    // OWNERSHIP: create_local_rendering_device() hands the device to us. It is
+    // created once by _ensure_device() and destroyed once by _shutdown_gpu().
+    // A rebuild must NOT churn it.
     RenderingDevice *rd = nullptr;          // local device (compute + render)
     RenderingDevice *shared_rd = nullptr;   // shared device (for compositor textures)
 
-    // GPU buffers (RIDs on the local device). Created as standalone storage
-    // buffers — not tied to any mesh.
+    // GPU buffers (RIDs on the local device). Standalone storage buffers —
+    // not tied to any mesh.
     RID vertex_buf;
     RID attrib_buf;
     RID chunk_buf;
     RID runnable_buf;
     RID sort_key_buf;
 
-    // Byte-stride/offset (in 4-byte words) describing how particle data is
-    // packed inside vertex_buf/attrib_buf. Fixed layout (not from mesh format).
-    int vertex_stride_floats  = 3;
-    int attrib_stride_words   = 0;
+    // Stride/offset (in 4-byte words) describing how particle data is packed
+    // inside vertex_buf/attrib_buf. Fixed layout; _build_gpu_resources reasserts
+    // these, but the defaults must already be valid because _create_vertex_array
+    // reads them.
+    int vertex_stride_floats  = 3;   // vec3 position
+    int attrib_stride_words   = 8;   // vec4 color + vec4 custom0
     int color_offset_words    = 0;
-    int custom0_offset_words  = 0;
+    int custom0_offset_words  = 4;
 
-    // Pipelines
+    // Compute pipelines
     RID clear_pipeline;
     RID physics_pipeline;
     RID sortkey_pipeline;
@@ -253,10 +300,15 @@ private:
     Vector3  pending_delta_origin;
     bool     delta_impulse_pending = false;
     Transform3D prev_global_transform;  // for computing node-movement impulses
-    Transform3D prev_delta_transform;  // for computing node-movement impulses
+    Transform3D prev_delta_transform;   // differencing baseline
     bool      has_prev_delta_transform = false;
     bool      has_prev_transform = false;
     bool      gpu_ready    = false;
+
+    // Incremented by every _build_gpu_resources. Child sources stamp the value
+    // they built against and rebuild when it moves, so a grid or particle-count
+    // change can never leave them dispatching against freed buffers.
+    uint64_t  gpu_generation = 0;
 
     // ── composite shader uniforms (Inspector-editable) ───────────────────
     float   smooth_radius       = 2.0f;
@@ -267,12 +319,6 @@ private:
     float   smooth_falloff      = 0.5f;
     float   coverage_threshold  = 0.5f;
 
-    // ── particle storage buffers ──────────────────────────────────────────────
-    // Standalone storage buffers on the local device (not tied to any mesh).
-    // vertex_buf: vec3 position per particle (stride 12 bytes)
-    // attrib_buf: vec4 color + vec4 custom0 per particle (stride 32 bytes)
-    // Written by compute shaders, read by the RD render pipeline.
-
     // ── RD offscreen render pipeline ─────────────────────────────────────────
     // Particles are rendered directly via a RenderingDevice render pipeline
     // into an RD framebuffer with a color attachment (RGBA8: rgb=color, a=1)
@@ -281,14 +327,13 @@ private:
     //
     // The composite quad (composite_node) is a MeshInstance3D with a spatial
     // shader that samples the color+depth textures and blurs/refracts/tints
-    // the screen. It is parented to the main camera so it's always in frustum.
+    // the screen. Created exactly once by _ensure_composite_node().
     MeshInstance3D  *composite_node     = nullptr;
     Ref<ShaderMaterial> composite_material;
     Ref<Shader>         composite_shader;     // fluid_composite.gdshader
-    Camera3D        *main_camera_cache = nullptr;  // resolved each frame from the SceneTree
 
-    // RD render pipeline resources (created in _ensure_rd_render_pipeline).
-    // All on the local device (rd) except the shared-device texture wrappers.
+    // RD render pipeline resources. All on the local device (rd) except the
+    // shared-device texture wrappers.
     RID     rd_render_shader;       // shader RID (vertex+fragment SPIR-V)
     RID     rd_render_pipeline;     // render pipeline RID
     RID     rd_camera_ubo;          // uniform buffer for camera matrices
@@ -302,6 +347,8 @@ private:
     Vector2i rd_vp_size;                // current offscreen texture size
 
     // Shared-device texture wrappers (so the composite shader can sample them).
+    // These alias the VkImages owned by rd_color_tex / rd_depth_tex, so they
+    // must always be released BEFORE the textures they alias.
     RID     shared_color_tex;       // shared-device view of rd_color_tex
     RID     shared_depth_tex;       // shared-device view of rd_depth_tex
 
@@ -314,17 +361,67 @@ private:
     PackedByteArray rd_pc_bytes;        // push constant data (updated each frame)
     bool rd_submitted = false;          // true after submit(), cleared by sync()
 
+    // ── Deferred RID destruction ────────────────────────────────────────────
+    // Godot's render thread samples our color/depth textures through Texture2DRD
+    // and can still be reading them for a few frames after we unbind. Freeing
+    // the underlying VkImage inline is a use-after-free — it shows up as a
+    // driver crash while the window is being resized. Anything the main
+    // renderer can observe is retired through this queue instead.
+    struct DeferredFree {
+        RID  rid;
+        int  frames_left      = 0;
+        bool on_shared_device = false;   // free on shared_rd rather than rd
+    };
+    std::vector<DeferredFree> deferred_frees;
+
+    void _queue_free_rid(RID r, bool on_shared_device);
+    void _process_deferred_frees(bool flush_now);
+    // Free a local-device RID and null the handle. Safe with an invalid RID or
+    // a null device.
+    void _free_local_rid(RID &r);
+
+    // ── Device lifetime ─────────────────────────────────────────────────────
+    bool _ensure_device();
+    void _shutdown_gpu();
+
+    // Tell every FluidSourceBase descendant to drop RIDs built against our
+    // buffers. Must run before any buffer teardown. Pass nullptr to start at
+    // `this`; the parameter exists for the recursive walk.
+    void _notify_children_gpu_reset(Node *from);
+
+    // ── Render resource construction ────────────────────────────────────────
+    // Each returns false and leaves nothing behind on failure, so a retry
+    // starts clean. _ensure_rd_render_pipeline orchestrates them.
     void _ensure_rd_render_pipeline();
+    RID  _compile_render_shader();
+    bool _create_vertex_array();
+    bool _create_render_uniform_set();
+    bool _create_render_targets(Vector2i size);
+    void _destroy_render_targets(bool deferred);
+    bool _create_render_pipeline_state();
+    void _bind_render_targets_to_composite();
+    void _ensure_composite_node();
+    void _destroy_composite_node();
+
     void _sync_rd_viewport_size();
-    void _render_particles_rd();
+    // Records the particle draw. Returns true if commands were recorded.
+    // Submission belongs to _process — an early return here must not strand
+    // the frame's compute lists unflushed.
+    bool _render_particles_rd();
     void _sync_offscreen_camera();
     // Recursively collect all Viewport descendants of `node` into `out`.
     // Used to find the editor's 3D viewport in editor mode.
     static void _collect_viewports(Node *node, TypedArray<Viewport> &out);
 
+    // ── Build / teardown ────────────────────────────────────────────────────
     void _build_gpu_resources();
+    void _rebuild_compute_uniform_sets();
+    // Release everything but KEEP the device. Idempotent.
     void _destroy_gpu_resources();
+    void _destroy_render_resources(bool deferred_targets);
+    void _destroy_sim_resources();
     void _rebuild_gpu_resources();
+
     // Sync pending GPU work on the local device (no-op if nothing submitted).
     void _sync_rd();
     // Reload a single compute shader by index: 0=clear, 1=physics, 2=sortkey.

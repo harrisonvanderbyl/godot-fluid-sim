@@ -2,14 +2,16 @@
 #include "fluid_particle_system.hpp"
 
 #include <godot_cpp/classes/rd_shader_spirv.hpp>
+#include <godot_cpp/classes/rd_shader_file.hpp>
 #include <godot_cpp/classes/rd_uniform.hpp>
+#include <godot_cpp/classes/resource_loader.hpp>
 #include <godot_cpp/core/class_db.hpp>
 #include <cstring>
 
 using namespace godot;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Push constants for the source/sink shader (48 bytes, 16-byte aligned)
+// Push constants for the source/sink shader (16-byte aligned)
 // ─────────────────────────────────────────────────────────────────────────────
 struct SourceSinkPC {
     float  world_pos[3];
@@ -27,11 +29,28 @@ struct SourceSinkPC {
     int32_t custom0_offset_words;
 };
 
+static_assert(sizeof(SourceSinkPC) % 16 == 0,
+              "SourceSinkPC must be 16-byte aligned for std430");
+static_assert(sizeof(SourceSinkPC) <= 128,
+              "SourceSinkPC must fit the 128-byte push constant guarantee");
+
 // ─────────────────────────────────────────────────────────────────────────────
 // FluidSourceBase
 // ─────────────────────────────────────────────────────────────────────────────
 FluidSourceBase::FluidSourceBase() {}
-FluidSourceBase::~FluidSourceBase() {}
+
+FluidSourceBase::~FluidSourceBase() {
+    // If we still hold RIDs at this point the parent device is either gone
+    // (in which case _destroy_pipeline correctly skips freeing) or still alive
+    // (in which case this is the last chance to give them back).
+    _destroy_pipeline();
+}
+
+void FluidSourceBase::_notification(int p_what) {
+    if (p_what == NOTIFICATION_PREDELETE) {
+        _destroy_pipeline();
+    }
+}
 
 void FluidSourceBase::_bind_methods() {
     ClassDB::bind_method(D_METHOD("set_radius", "v"),  &FluidSourceBase::set_radius);
@@ -53,45 +72,101 @@ void FluidSourceBase::_bind_methods() {
         "set_shader_path", "get_shader_path");
 }
 
-void FluidSourceBase::_enter_tree() {
-    // Just mark parent — actual GPU init deferred to first _process
-    Node *p = get_parent();
-    while (p) {
-        parent_system = Object::cast_to<FluidParticleSystem>(p);
-        if (parent_system) break;
-        p = p->get_parent();
-    }
-    if (!parent_system) {
-        UtilityFunctions::printerr("FluidSource/Sink: no FluidParticleSystem ancestor found.");
-    }
-}
-
-void FluidSourceBase::dispatch_into_parent() {
-    if (!active || !parent_system) return;
-
-    // Lazy init: wait until parent has GPU resources ready
-    if (!gpu_ready) {
-        if (tried_init) return;
-        rd = parent_system->get_rd();
-        if (!rd) return;  // parent not ready yet, try again next frame
-        _build_pipeline();
-        tried_init = true;
-        return;  // don't dispatch on the init frame
-    }
-
-    if (!pipeline.is_valid() || !uniform_set.is_valid()) return;
-    _dispatch();
-}
-
-void FluidSourceBase::_exit_tree() {
-    _destroy_pipeline();
+// Changing the shader path invalidates the built pipeline.
+void FluidSourceBase::set_shader_path(const String &v) {
+    if (shader_path == v) return;
+    shader_path = v;
+    _destroy_pipeline();   // resets tried_init, so the next frame rebuilds
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-void FluidSourceBase::_build_pipeline() {
-    if (!rd) return;
+// Resolve the parent system through ObjectID rather than a raw pointer. The old
+// code cached FluidParticleSystem* in _enter_tree and never cleared it, so any
+// path where the parent was freed first left a dangling dereference.
+// ─────────────────────────────────────────────────────────────────────────────
+FluidParticleSystem *FluidSourceBase::_parent() const {
+    if (!parent_id.is_valid()) return nullptr;
+    return Object::cast_to<FluidParticleSystem>(ObjectDB::get_instance(parent_id));
+}
 
-    Ref<RDShaderFile> sf = ResourceLoader::get_singleton()->load(shader_path);
+void FluidSourceBase::_enter_tree() {
+    parent_id = ObjectID();
+
+    Node *p = get_parent();
+    while (p) {
+        if (FluidParticleSystem *ps = Object::cast_to<FluidParticleSystem>(p)) {
+            parent_id = ps->get_instance_id();
+            break;
+        }
+        p = p->get_parent();
+    }
+    if (!parent_id.is_valid()) {
+        UtilityFunctions::printerr("FluidSource/Sink: no FluidParticleSystem ancestor found.");
+    }
+    // Force a fresh build against whatever generation the parent is on now.
+    tried_init = false;
+    built_generation = 0;
+}
+
+void FluidSourceBase::_exit_tree() {
+    // Godot propagates EXIT_TREE to children before the parent, so the parent's
+    // device is still alive here and we can hand our RIDs back cleanly.
+    _destroy_pipeline();
+    parent_id = ObjectID();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Called by FluidParticleSystem immediately before it frees the storage buffers
+// our uniform set points at. Without this hook, a grid-size or particle-count
+// change in the inspector left every source holding a uniform set bound to
+// freed buffers plus a raw pointer to a destroyed device — the next dispatch
+// bound both.
+// ─────────────────────────────────────────────────────────────────────────────
+void FluidSourceBase::on_parent_gpu_reset() {
+    _destroy_pipeline();
+}
+
+void FluidSourceBase::dispatch_into_parent() {
+    if (!active) return;
+
+    FluidParticleSystem *ps = _parent();
+    if (!ps || !ps->is_gpu_ready()) return;
+
+    RenderingDevice *dev = ps->get_rd();
+    if (!dev) return;
+
+    // Detect a parent rebuild we were not told about (device swapped, or the
+    // generation counter moved). Cheap insurance on top of on_parent_gpu_reset.
+    if (gpu_ready && (dev != rd || built_generation != ps->get_gpu_generation())) {
+        _destroy_pipeline();
+    }
+
+    if (!gpu_ready) {
+        if (tried_init) return;      // build already failed this generation
+        tried_init = true;
+        rd = dev;
+        _build_pipeline(ps);
+        return;                      // don't dispatch on the init frame
+    }
+
+    if (!pipeline.is_valid() || !uniform_set.is_valid()) return;
+    _dispatch(ps);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+void FluidSourceBase::_build_pipeline(FluidParticleSystem *ps) {
+    if (!rd || !ps) return;
+
+    RID particle_buf  = ps->get_vertex_buf();
+    RID attribute_buf = ps->get_attribute_buf();
+    RID chunk_buf     = ps->get_chunk_buf();
+    if (!particle_buf.is_valid() || !attribute_buf.is_valid() || !chunk_buf.is_valid()) {
+        UtilityFunctions::printerr("FluidSource/Sink: parent buffers not ready.");
+        return;
+    }
+
+    Ref<RDShaderFile> sf = ResourceLoader::get_singleton()->load(
+        shader_path, "", ResourceLoader::CACHE_MODE_REPLACE);
     if (!sf.is_valid()) {
         UtilityFunctions::printerr("FluidSource/Sink: cannot load shader: ", shader_path);
         return;
@@ -106,23 +181,17 @@ void FluidSourceBase::_build_pipeline() {
         UtilityFunctions::printerr("FluidSource/Sink: shader error: ", err);
         return;
     }
-    shader_rid = rd->shader_create_from_spirv(spirv);
-    pipeline   = rd->compute_pipeline_create(shader_rid);
 
-    // Uniform set: binding 0 = particle_buf, binding 1 = chunk_buf (shared with parent)
-    RID particle_buf = parent_system->get_vertex_buf();
-    RID attribute_buf = parent_system->get_attribute_buf();
-    RID chunk_buf    = parent_system->get_chunk_buf();
-    if (!particle_buf.is_valid()) {
-        UtilityFunctions::printerr("FluidSource/Sink: parent particle_buf is invalid.");
+    shader_rid = rd->shader_create_from_spirv(spirv);
+    if (!shader_rid.is_valid()) {
+        UtilityFunctions::printerr("FluidSource/Sink: failed to create shader RID.");
         return;
     }
-    if (!attribute_buf.is_valid()) {
-        UtilityFunctions::printerr("FluidSource/Sink: parent attribute_buf is invalid.");
-        return;
-    }
-    if (!chunk_buf.is_valid()) {
-        UtilityFunctions::printerr("FluidSource/Sink: parent chunk_buf is invalid.");
+    pipeline = rd->compute_pipeline_create(shader_rid);
+    if (!pipeline.is_valid()) {
+        UtilityFunctions::printerr("FluidSource/Sink: failed to create compute pipeline.");
+        rd->free_rid(shader_rid);
+        shader_rid = RID();
         return;
     }
 
@@ -136,31 +205,61 @@ void FluidSourceBase::_build_pipeline() {
     };
 
     TypedArray<RDUniform> uniforms;
-    uniforms.append(make_storage_uniform(particle_buf, 0));
+    uniforms.append(make_storage_uniform(particle_buf,  0));
     uniforms.append(make_storage_uniform(attribute_buf, 1));
-    if (chunk_buf.is_valid()) {
-        uniforms.append(make_storage_uniform(chunk_buf, 2));
-    }
+    uniforms.append(make_storage_uniform(chunk_buf,     2));
     uniform_set = rd->uniform_set_create(uniforms, shader_rid, 0);
+    if (!uniform_set.is_valid()) {
+        UtilityFunctions::printerr("FluidSource/Sink: failed to create uniform set.");
+        rd->free_rid(pipeline);
+        rd->free_rid(shader_rid);
+        pipeline   = RID();
+        shader_rid = RID();
+        return;
+    }
 
+    // Stamp the generation we built against, so a later parent rebuild is
+    // detected even if the reset notification is missed.
+    built_generation = ps->get_gpu_generation();
     gpu_ready = true;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Idempotent teardown. The original never nulled the RIDs and never reset
+// tried_init, so a second call double-freed and a re-enter could never rebuild.
+// ─────────────────────────────────────────────────────────────────────────────
 void FluidSourceBase::_destroy_pipeline() {
-    if (!rd) return;
-    gpu_ready = false;
-    if (uniform_set.is_valid()) rd->free_rid(uniform_set);
-    if (pipeline.is_valid())    rd->free_rid(pipeline);
-    if (shader_rid.is_valid())  rd->free_rid(shader_rid);
+    gpu_ready  = false;
+    tried_init = false;
+
+    FluidParticleSystem *ps = _parent();
+
+    // Only free if the device we built against is STILL the parent's device.
+    // If the parent tore down or swapped its device, these RIDs are already
+    // gone and freeing them would hit a destroyed allocator.
+    bool device_still_ours = (rd != nullptr) && ps && (ps->get_rd() == rd);
+
+    if (device_still_ours) {
+        if (uniform_set.is_valid()) rd->free_rid(uniform_set);
+        if (pipeline.is_valid())    rd->free_rid(pipeline);
+        if (shader_rid.is_valid())  rd->free_rid(shader_rid);
+    }
+
+    uniform_set = RID();
+    pipeline    = RID();
+    shader_rid  = RID();
+    rd          = nullptr;
+    built_generation = 0;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-void FluidSourceBase::_dispatch() {
+void FluidSourceBase::_dispatch(FluidParticleSystem *ps) {
+    if (!rd || !ps) return;
     if (!pipeline.is_valid() || !uniform_set.is_valid()) return;
 
     // Transform our world position into the parent system's local space
     // (the grid is in parent-local coordinates)
-    Vector3 local_pos = parent_system->to_local(get_global_position());
+    Vector3 local_pos = ps->to_local(get_global_position());
 
     SourceSinkPC pc{};
     pc.world_pos[0]  = local_pos.x;
@@ -169,14 +268,14 @@ void FluidSourceBase::_dispatch() {
     pc.radius        = radius;
     pc.mode          = get_mode();
     pc.max_count     = rate;
-    pc.num_particles = parent_system->get_num_particles();
-    pc.grid_w        = parent_system->get_grid_w();
-    pc.grid_h        = parent_system->get_grid_h();
-    pc.grid_d        = parent_system->get_grid_d();
-    pc.vertex_stride_floats = parent_system->get_vertex_stride_floats();
-    pc.attrib_stride_words  = parent_system->get_attrib_stride_words();
-    pc.color_offset_words   = parent_system->get_color_offset_words();
-    pc.custom0_offset_words = parent_system->get_custom0_offset_words();
+    pc.num_particles = ps->get_num_particles();
+    pc.grid_w        = ps->get_grid_w();
+    pc.grid_h        = ps->get_grid_h();
+    pc.grid_d        = ps->get_grid_d();
+    pc.vertex_stride_floats = ps->get_vertex_stride_floats();
+    pc.attrib_stride_words  = ps->get_attrib_stride_words();
+    pc.color_offset_words   = ps->get_color_offset_words();
+    pc.custom0_offset_words = ps->get_custom0_offset_words();
 
     // Fill source-specific attributes (subclass overrides for sink, but the
     // values are ignored by the shader in sink mode)
@@ -195,15 +294,17 @@ void FluidSourceBase::_dispatch() {
         pc.opacity_fade = 0;
     }
 
+    if (pc.num_particles <= 0) return;
+
     PackedByteArray pc_bytes;
     pc_bytes.resize(sizeof(SourceSinkPC));
     memcpy(pc_bytes.ptrw(), &pc, sizeof(SourceSinkPC));
 
     // Dispatch enough groups to cover all particles (strided scan)
-    int np = pc.num_particles;
-    uint32_t groups = (uint32_t)((np + 63) / 64);
+    uint32_t groups = (uint32_t)((pc.num_particles + 63) / 64);
 
     int64_t cl = rd->compute_list_begin();
+    if (cl < 0) return;
     rd->compute_list_bind_compute_pipeline(cl, pipeline);
     rd->compute_list_bind_uniform_set(cl, uniform_set, 0);
     rd->compute_list_set_push_constant(cl, pc_bytes, sizeof(SourceSinkPC));

@@ -52,7 +52,7 @@ layout(push_constant, std430) uniform PC {
     float viewport_w;          // viewport width in pixels
     float viewport_h;          // viewport height in pixels
     float offscreen_far;       // far plane for linear depth normalization
-    float _pad0;
+    float fluid_size;
 } pc;
 
 // Vertex attributes — match the render mesh's storage-buffer layout:
@@ -84,9 +84,8 @@ const float MAX_POINT_SIZE = 255.0;
 
 void main() {
     float neighbors_filled = in_custom0.z;
-    bool  is_solid    = (in_color.a > (200.0 / 255.0));
-    float radius      = is_solid ? 1.125 : 2.5;
-    float radius_grow = is_solid ? 0.125 : 0.0;
+    float radius      = pc.fluid_size;
+    float radius_grow = 0.0;
     radius = max(radius + neighbors_filled * radius_grow, 0.0);
 
     vec4 world       = cam.model_matrix * vec4(in_position, 1.0);
@@ -100,9 +99,8 @@ void main() {
     // then only write depth that is >= this value, which is what makes the
     // conservative depth qualifier below legal.
     vec3 near_view = center_view;
-    near_view.z += radius;
+    //near_view.z += radius;
 
-    gl_Position = cam.proj_matrix * vec4(near_view, 1.0);
 
     // Projected radius in pixels, derived from the actual projection matrix:
     //   px = r * (1 / tan(fov_y/2)) * height / (2 * dist)
@@ -112,7 +110,10 @@ void main() {
     float dist = max(-near_view.z, 0.001);
     float px   = radius * abs(cam.proj_matrix[1][1]) * pc.viewport_h * POINT_SIZE_PAD
                / (2.0 * dist);
-    gl_PointSize = clamp(px, 1.0, MAX_POINT_SIZE);
+    float ps = clamp(px, 1.0, MAX_POINT_SIZE);
+    gl_PointSize = ps;
+
+    gl_Position = cam.proj_matrix * vec4(near_view, 1.0);
 }
 
 #[fragment]
@@ -133,7 +134,7 @@ layout(push_constant, std430) uniform PC {
     float viewport_w;
     float viewport_h;
     float offscreen_far;
-    float _pad0;
+    float fluid_size;
 } pc;
 
 layout(location = 0) flat in vec4 v_center_radius;
@@ -147,12 +148,11 @@ layout(location = 1) flat in vec4 v_color;
 // the same either way; only this qualifier changes.
 // #define REVERSE_Z
 
-layout(depth_greater) out float gl_FragDepth;
+layout(depth_less) out float gl_FragDepth;
 
 
 // Color output: rgb = particle color, a = coverage (1.0 = opaque).
 layout(location = 0) out vec4 out_color;
-
 void main() {
     // Discard pixels outside the point-sprite circle. Redundant with the
     // discriminant test below, but far cheaper — keep it first.

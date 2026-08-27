@@ -24,6 +24,7 @@
 #include <godot_cpp/core/memory.hpp>
 #include <cstring>
 #include <cmath>
+#include <limits>
 #include <vector>
 #include <algorithm>
 
@@ -194,11 +195,24 @@ void FluidParticleSystem::_bind_methods() {
     ClassDB::bind_method(D_METHOD("get_smooth_falloff"),           &FluidParticleSystem::get_smooth_falloff);
     ClassDB::bind_method(D_METHOD("set_coverage_threshold","v"),   &FluidParticleSystem::set_coverage_threshold);
     ClassDB::bind_method(D_METHOD("get_coverage_threshold"),        &FluidParticleSystem::get_coverage_threshold);
-
+    ClassDB::bind_method(D_METHOD("set_fluid_particle_size","v"), &FluidParticleSystem::set_fluid_particle_size);
+    ClassDB::bind_method(D_METHOD("get_fluid_particle_size"), &FluidParticleSystem::get_fluid_particle_size);
     ClassDB::bind_method(D_METHOD("reload_physics_shader"), &FluidParticleSystem::reload_physics_shader);
     ClassDB::bind_method(D_METHOD("get_reload_physics_shader"), &FluidParticleSystem::get_reload_physics_shader);
     ClassDB::bind_method(D_METHOD("reload_render_shader"),  &FluidParticleSystem::reload_render_shader);
     ClassDB::bind_method(D_METHOD("get_reload_render_shader"), &FluidParticleSystem::get_reload_render_shader);
+
+
+    ClassDB::bind_method(D_METHOD("apply_sdf_to_velocity_field"),
+                         &FluidParticleSystem::apply_sdf_to_velocity_field);
+    ClassDB::bind_method(D_METHOD("reload_sdf_and_clear_grid"),
+                         &FluidParticleSystem::reload_sdf_and_clear_grid);
+    ClassDB::bind_method(D_METHOD("get_reload_sdf_and_clear_grid"),
+                         &FluidParticleSystem::get_reload_sdf_and_clear_grid);
+    // Internal — signal callback from VoxelTerrain, not exposed in inspector.
+    // Takes a Variant (the block position Vector3i) which we ignore.
+    ClassDB::bind_method(D_METHOD("_on_terrain_block_loaded", "position"),
+                         &FluidParticleSystem::_on_terrain_block_loaded);
 
     // ── Inspector layout ───────────────────────────────────────────────────
     // Reload button at the top for quick iteration.
@@ -211,6 +225,10 @@ void FluidParticleSystem::_bind_methods() {
             PROPERTY_HINT_TOOL_BUTTON, "Reload Render Shader,Reload",
             PROPERTY_USAGE_EDITOR),
             "", "get_reload_render_shader");
+    ADD_PROPERTY(PropertyInfo(Variant::CALLABLE, "reload_sdf_and_clear_grid",
+            PROPERTY_HINT_TOOL_BUTTON, "Reload SDF & Clear Grid,Reload",
+            PROPERTY_USAGE_EDITOR),
+            "", "get_reload_sdf_and_clear_grid");
 
     // Compute shader paths.
     ADD_PROPERTY(PropertyInfo(Variant::STRING, "clear_shader_path",
@@ -247,9 +265,15 @@ void FluidParticleSystem::_bind_methods() {
     ADD_PROPERTY(PropertyInfo(Variant::VECTOR3I, "initial_chunk_size"),                            "set_initial_chunk_size",       "get_initial_chunk_size");
     ADD_PROPERTY(PropertyInfo(Variant::COLOR,    "initial_chunk_color"),                           "set_initial_chunk_color",      "get_initial_chunk_color");
     ADD_PROPERTY(PropertyInfo(Variant::FLOAT,    "initial_chunk_attraction", PROPERTY_HINT_RANGE, "-2,2,0.01"), "set_initial_chunk_attraction", "get_initial_chunk_attraction");
+    
+    // SDF terrain collision group.
+    ADD_GROUP("SDF", "sdf_");
+    ADD_GROUP("", "");
 
     // Composite shader uniforms group.
     ADD_GROUP("Composite", "composite_");
+    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "composite_fluid_particle_size", PROPERTY_HINT_RANGE, "0,10,0.01"), "set_fluid_particle_size", "get_fluid_particle_size");
+
     ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "composite_smooth_radius",       PROPERTY_HINT_RANGE, "0,10,0.01"),  "set_smooth_radius",       "get_smooth_radius");
     ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "composite_tint_strength",       PROPERTY_HINT_RANGE, "0,2,0.01"),   "set_tint_strength",        "get_tint_strength");
     ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "composite_refraction_strength", PROPERTY_HINT_RANGE, "0,0.2,0.001"),"set_refraction_strength",  "get_refraction_strength");
@@ -263,6 +287,12 @@ void FluidParticleSystem::_bind_methods() {
 // ─────────────────────────────────────────────────────────────────────────────
 // Composite uniform setters — push to the active composite material.
 // ─────────────────────────────────────────────────────────────────────────────
+void FluidParticleSystem::set_fluid_particle_size(float v) {
+    fluid_particle_size = v;
+    Ref<ShaderMaterial> comp = _active_composite_material();
+    if (comp.is_valid()) comp->set_shader_parameter("fluid_particle_size", v);
+}
+
 void FluidParticleSystem::set_smooth_radius(float v) {
     smooth_radius = v;
     Ref<ShaderMaterial> comp = _active_composite_material();
@@ -1093,13 +1123,13 @@ bool FluidParticleSystem::_render_particles_rd() {
         float viewport_w;
         float viewport_h;
         float offscreen_far;
-        float _pad0;
+        float fluid_point_size;  // optional: could be used to scale point size in shader
     };
     RenderPushConstants pc{};
     pc.viewport_w    = (float)rd_vp_size.x;
     pc.viewport_h    = (float)rd_vp_size.y;
     pc.offscreen_far = (float)main_cam->get_far();
-    pc._pad0 = 0.0f;
+    pc.fluid_point_size = fluid_particle_size;  // optional: could be used to scale point size in shader
 
     rd_pc_bytes.resize(sizeof(RenderPushConstants));
     memcpy(rd_pc_bytes.ptrw(), &pc, sizeof(RenderPushConstants));
@@ -1241,6 +1271,19 @@ void FluidParticleSystem::_enter_tree() {
     if (!_ensure_device()) return;
     _build_gpu_resources();
     _ensure_rd_render_pipeline();
+
+    // Instantiate a VoxelTerrain child sized to the fluid grid and extract
+    // its SDF into the chunk buffer.
+    _refresh_sdf_from_child();
+
+    // Bake the SDF (now in sdf_storage_buf) into the chunk grid's sdf_bits
+    // field via clear_grid. Without this the chunk buffer stays zero-filled
+    // and the physics shader's collision check (sdf < 0) never fires.
+    _sync_rd();
+    _dispatch_clear_grid();
+    rd->submit();
+    rd->sync();
+    rd_submitted = false;
 }
 
 void FluidParticleSystem::_exit_tree() {
@@ -1420,6 +1463,29 @@ void FluidParticleSystem::_build_gpu_resources() {
         return;
     }
 
+    // ── SDF storage buffer ──────────────────────────────────────────────────
+    // Allocated once at the full grid size (grid_w * grid_h * grid_d floats)
+    // and never reallocated. clear_grid.glsl reads it directly at binding 5.
+    // When no SDF is loaded the contents are zero (sdf==0 → treated as surface
+    // by the shader, harmless) and has_sdf=0 in the push constant skips the
+    // collision path. _upload_sdf_data just buffer_update's into this buffer.
+    {
+        int64_t sdf_floats = (int64_t)grid_width * grid_height * grid_depth;
+        PackedByteArray zeros;
+        zeros.resize(sdf_floats * sizeof(float));
+        zeros.fill(0);
+        sdf_storage_buf = rd->storage_buffer_create(sdf_floats * sizeof(float), zeros);
+        // Track the dimensions the shader expects (1:1 with the fluid grid).
+        sdf_w = grid_width;
+        sdf_h = grid_height;
+        sdf_d = grid_depth;
+    }
+
+    // Upload SDF data if a VoxelBuffer was assigned before the GPU was ready.
+    if (sdf_buffer_var.get_type() != Variant::NIL) {
+        _upload_sdf_data();
+    }
+
     // ── Load and compile compute shaders ─────────────────────────────────────
     clear_shader   = _compile_compute_shader(clear_shader_path);
     physics_shader = _compile_compute_shader(physics_shader_path);
@@ -1446,6 +1512,8 @@ void FluidParticleSystem::_build_gpu_resources() {
 //   binding 2 -> chunk_grid
 //   binding 3 -> runnable_indices
 //   binding 4 -> sort_keys
+// clear_grid additionally binds:
+//   binding 5 -> SDF data (float[], ZXY order) or a dummy buffer
 void FluidParticleSystem::_rebuild_compute_uniform_sets() {
     if (!rd) return;
 
@@ -1456,12 +1524,24 @@ void FluidParticleSystem::_rebuild_compute_uniform_sets() {
     uniforms.append(_make_storage_uniform(runnable_buf, 3));
     uniforms.append(_make_storage_uniform(sort_key_buf, 4));
 
-    if (clear_shader.is_valid() && !clear_uniform_set.is_valid())
-        clear_uniform_set   = rd->uniform_set_create(uniforms, clear_shader,   0);
     if (physics_shader.is_valid() && !physics_uniform_set.is_valid())
         physics_uniform_set = rd->uniform_set_create(uniforms, physics_shader, 0);
     if (sortkey_shader.is_valid() && !sortkey_uniform_set.is_valid())
         sortkey_uniform_set = rd->uniform_set_create(uniforms, sortkey_shader, 0);
+
+    // clear_grid gets its own uniform set with the extra SDF binding.
+    // sdf_storage_buf is always valid (allocated at grid size in
+    // _build_gpu_resources), so there's no dummy fallback.
+    if (clear_shader.is_valid() && !clear_uniform_set.is_valid()) {
+        TypedArray<RDUniform> clear_uniforms;
+        clear_uniforms.append(_make_storage_uniform(vertex_buf,   0));
+        clear_uniforms.append(_make_storage_uniform(attrib_buf,   1));
+        clear_uniforms.append(_make_storage_uniform(chunk_buf,    2));
+        clear_uniforms.append(_make_storage_uniform(runnable_buf, 3));
+        clear_uniforms.append(_make_storage_uniform(sort_key_buf, 4));
+        clear_uniforms.append(_make_storage_uniform(sdf_storage_buf, 5));
+        clear_uniform_set = rd->uniform_set_create(clear_uniforms, clear_shader, 0);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1511,6 +1591,7 @@ void FluidParticleSystem::_destroy_sim_resources() {
         clear_shader      = RID();  physics_shader      = RID();  sortkey_shader      = RID();
         vertex_buf = RID(); attrib_buf = RID(); chunk_buf = RID();
         runnable_buf = RID(); sort_key_buf = RID();
+        sdf_storage_buf = RID();
         return;
     }
 
@@ -1533,6 +1614,7 @@ void FluidParticleSystem::_destroy_sim_resources() {
     _free_local_rid(chunk_buf);
     _free_local_rid(runnable_buf);
     _free_local_rid(sort_key_buf);
+    _free_local_rid(sdf_storage_buf);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1579,6 +1661,20 @@ void FluidParticleSystem::_process(double delta) {
     _process_deferred_frees(false);
 
     if (!rd) return;
+
+    // Debounced SDF recopy: if the terrain streamed in new blocks since last
+    // frame, re-extract + upload + dispatch clear_grid to refresh sdf_bits.
+    // Runs before the simulation step so the physics shader sees fresh SDF.
+    if (sdf_refresh_pending && gpu_ready) {
+        sdf_refresh_pending = false;
+        _sync_rd();
+        _refresh_sdf_from_child();
+        _upload_sdf_data();
+        _dispatch_clear_grid(true);
+        rd->submit();
+        rd->sync();
+        rd_submitted = false;
+    }
 
     // Sync the RD render pipeline to the main camera (resize textures, push
     // composite uniforms, position the composite quad). This must run BEFORE
@@ -1694,27 +1790,28 @@ void FluidParticleSystem::_process(double delta) {
 static void dispatch_compute(RenderingDevice *rd,
                              RID pipeline, RID uniform_set,
                              const PushConstants &pc,
-                             uint32_t x_groups, uint32_t y_groups = 1, uint32_t z_groups = 1)
+                             uint32_t x_groups, uint32_t y_groups = 1, uint32_t z_groups = 1,
+                             uint32_t pc_size = sizeof(PushConstants))
 {
     if (!rd) return;
     if (!pipeline.is_valid() || !uniform_set.is_valid()) return;
     if (x_groups == 0 || y_groups == 0 || z_groups == 0) return;
 
     PackedByteArray pc_bytes;
-    pc_bytes.resize(sizeof(PushConstants));
-    memcpy(pc_bytes.ptrw(), &pc, sizeof(PushConstants));
+    pc_bytes.resize(pc_size);
+    memcpy(pc_bytes.ptrw(), &pc, pc_size);
 
     int64_t cl = rd->compute_list_begin();
     if (cl < 0) return;
     rd->compute_list_bind_compute_pipeline(cl, pipeline);
     rd->compute_list_bind_uniform_set(cl, uniform_set, 0);
-    rd->compute_list_set_push_constant(cl, pc_bytes, sizeof(PushConstants));
+    rd->compute_list_set_push_constant(cl, pc_bytes, pc_size);
     rd->compute_list_dispatch(cl, x_groups, y_groups, z_groups);
     rd->compute_list_end();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-void FluidParticleSystem::_dispatch_clear_grid() {
+void FluidParticleSystem::_dispatch_clear_grid(bool keep_occupant) {
     if (!rd) return;
 
     PushConstants pc{};
@@ -1723,9 +1820,34 @@ void FluidParticleSystem::_dispatch_clear_grid() {
     pc.grid_d         = grid_depth;
     pc.num_particles  = num_particles;
 
+    // SDF params are packed into the portion of the 128-byte push constant
+    // blob that clear_grid.glsl owns but the other two shaders leave unused
+    // (has_delta / max_occupancy / back_pressure / delta_row). The clear_grid
+    // shader reinterprets these bytes as SDF fields.
+    if (sdf_storage_buf.is_valid()) {
+        pc.has_delta    = 1.0f;                 // has_sdf flag
+        // max_occupancy (int32 at offset 72) is skipped — clear_grid pads over it
+        pc.back_pressure = sdf_strength;        // offset 76
+        pc.delta_row[0]  = (float)sdf_w;        // offset 80
+        pc.delta_row[1]  = (float)sdf_h;        // offset 84
+        pc.delta_row[2]  = (float)sdf_d;        // offset 88
+        // offset/scale are always 0/1 — terrain and fluid share the same space
+        pc.delta_row[3]  = 0.0f;               // offset 92  (sdf_offset_x)
+        pc.delta_row[4]  = 0.0f;               // offset 96  (sdf_offset_y)
+        pc.delta_row[5]  = 0.0f;               // offset 100 (sdf_offset_z)
+        pc.delta_row[6]  = 1.0f;               // offset 104 (sdf_scale)
+        pc.delta_row[7]  = keep_occupant ? 1.0f : 0.0f;  // offset 108
+    } else {
+        pc.has_delta = 0.0f;
+        pc.delta_row[7] = keep_occupant ? 1.0f : 0.0f;
+    }
+
     int64_t cell_count = (int64_t)grid_width * grid_height * grid_depth;
     uint32_t groups = (uint32_t)((cell_count + 63) / 64);
-    dispatch_compute(rd, clear_pipeline, clear_uniform_set, pc, groups);
+    // clear_grid.glsl declares 112 bytes of push constants (the physics/sortkey
+    // shaders use the full 128). Send only what the shader expects.
+    constexpr uint32_t CLEAR_PC_SIZE = 112;
+    dispatch_compute(rd, clear_pipeline, clear_uniform_set, pc, groups, 1, 1, CLEAR_PC_SIZE);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1877,6 +1999,384 @@ void FluidParticleSystem::reset_grid() {
     rd->submit();
     rd->sync();
     rd_submitted = false;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SDF terrain collision
+//
+// The connected VoxelBuffer's CHANNEL_SDF is read once on the CPU, decoded to
+// float (handling 8/16/32-bit depths and the godot_voxel quantization scales),
+// and uploaded to a GPU storage buffer. The clear_grid shader samples it to
+// bake the SDF gradient (surface normal) into the persistent chunk velocity
+// field. The physics shader then reads that velocity each frame, pushing
+// particles out of the terrain.
+//
+// VoxelBuffer is from a separate GDExtension (godot_voxel) whose headers we
+// don't link against, so methods are called through Object::call.
+// ─────────────────────────────────────────────────────────────────────────────
+
+
+void FluidParticleSystem::apply_sdf_to_velocity_field() {
+    if (!gpu_ready || !rd) return;
+    if (!sdf_storage_buf.is_valid()) {
+        UtilityFunctions::printerr("FluidParticleSystem: no SDF buffer connected.");
+        return;
+    }
+    _sync_rd();
+    _dispatch_clear_grid();
+    rd->submit();
+    rd->sync();
+    rd_submitted = false;
+}
+
+void FluidParticleSystem::reload_sdf_and_clear_grid() {
+    if (!gpu_ready || !rd) return;
+    _sync_rd();
+    // Re-extract the SDF from the child VoxelTerrain (picks up terrain edits).
+    _refresh_sdf_from_child();
+    // _upload_sdf_data buffer_update's into the existing sdf_storage_buf
+    // (allocated once at grid size in _build_gpu_resources), so the uniform
+    // set never needs rebuilding.
+    _upload_sdf_data();
+    // Update the sdf_bits field in the chunk grid without clearing occupants.
+    _dispatch_clear_grid(true);
+    rd->submit();
+    rd->sync();
+    rd_submitted = false;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Dynamic property forwarding for the child VoxelTerrain.
+// VoxelTerrain's properties are exposed on this node under a "Terrain" group
+// with a "terrain_" prefix, so the user can edit them without finding the
+// internal child node. Values are cached so they survive child recreation.
+// ─────────────────────────────────────────────────────────────────────────────
+
+Object *FluidParticleSystem::_get_voxel_terrain_child() const {
+    if (!voxel_terrain_child_id.is_valid()) {
+        return nullptr;
+    }
+    return Object::cast_to<Object>(ObjectDB::get_instance(voxel_terrain_child_id));
+}
+
+bool FluidParticleSystem::_set(const StringName &p_name, const Variant &p_value) {
+    String name = p_name;
+    if (name.begins_with("terrain_")) {
+        String real_name = name.substr(8);  // strlen("terrain_") == 8
+        _terrain_property_cache[real_name] = p_value;
+        Object *child = _get_voxel_terrain_child();
+        if (child) {
+            child->set(real_name, p_value);
+        }
+        return true;
+    }
+    return false;
+}
+
+bool FluidParticleSystem::_get(const StringName &p_name, Variant &r_ret) const {
+    String name = p_name;
+    if (name.begins_with("terrain_")) {
+        String real_name = name.substr(8);
+        Object *child = _get_voxel_terrain_child();
+        if (child) {
+            r_ret = child->get(real_name);
+            return true;
+        }
+        // Fall back to cache (child not created yet, e.g. editor preview).
+        if (_terrain_property_cache.has(real_name)) {
+            r_ret = _terrain_property_cache[real_name];
+            return true;
+        }
+        return false;
+    }
+    return false;
+}
+
+
+// Signal callback from VoxelTerrain (block_loaded / mesh_block_entered).
+// Just sets a flag — _process does the debounced recopy so a burst of block
+// loads doesn't trigger N GPU dispatches.
+void FluidParticleSystem::_on_terrain_block_loaded(const Variant &p_position) {
+    sdf_refresh_pending = true;
+}
+
+bool FluidParticleSystem::_refresh_sdf_from_child() {
+    // Instantiate a VoxelTerrain child if we don't have one yet. VoxelTerrain
+    // is from the godot_voxel addon (separate GDExtension), so we create it
+    // by class name via ClassDB.
+    Object *terrain = nullptr;
+    if (voxel_terrain_child_id.is_valid()) {
+        terrain = Object::cast_to<Object>(ObjectDB::get_instance(voxel_terrain_child_id));
+    }
+    if (!terrain) {
+        // see if has child with class type VoxelTerrain
+        for (int i = 0; i < get_child_count(); i++) {
+            Object *child = get_child(i);
+            if (child && child->is_class("VoxelTerrain")) {
+                terrain = child;
+                voxel_terrain_child_id = terrain->get_instance_id();
+                
+                terrain->connect("block_loaded",
+                        Callable(this, "_on_terrain_block_loaded"));
+                terrain->connect("mesh_block_entered",
+                        Callable(this, "_on_terrain_block_loaded"));
+                break;
+            }
+        }
+    }
+    if (!terrain) {
+        Variant v = ClassDB::instantiate("VoxelTerrain");
+        terrain = Object::cast_to<Object>(v);
+        if (!terrain) {
+            UtilityFunctions::printerr("FluidParticleSystem: VoxelTerrain class not found. Is the godot_voxel addon enabled?");
+            return false;
+        }
+        // Add as child so it enters the tree and starts generating.
+        Node *terrain_node = Object::cast_to<Node>(terrain);
+        if (terrain_node) {
+            terrain_node->set_name("VoxelTerrain");
+            add_child(terrain_node);
+            voxel_terrain_child_id = terrain_node->get_instance_id();
+            // In the editor, set the owner to the edited scene root so the
+            // child shows up in the scene tree dock and can be selected/edited
+            // directly. At runtime the owner stays null (no scene tree dock).
+            if (Engine::get_singleton()->is_editor_hint()) {
+                if (SceneTree *tree = get_tree()) {
+                    if (Node *root = tree->get_edited_scene_root()) {
+                        terrain_node->set_owner(root);
+                    }
+                }
+            }
+            // Apply terrain properties that were set before the child existed.
+            for (const auto &E : _terrain_property_cache) {
+                terrain->set(E.key, E.value);
+            }
+            // Connect block_loaded + mesh_block_entered so we recopy the SDF
+            // when the terrain streams in new data. The callback just sets a
+            // flag; _process does the debounced recopy.
+            terrain->connect("block_loaded",
+                    Callable(this, "_on_terrain_block_loaded"));
+            terrain->connect("mesh_block_entered",
+                    Callable(this, "_on_terrain_block_loaded"));
+        }
+    }else{
+        if (Engine::get_singleton()->is_editor_hint()) {
+            if (SceneTree *tree = get_tree()) {
+                if (Node *root = tree->get_edited_scene_root()) {
+                    
+                    Node *terrain_node = Object::cast_to<Node>(terrain);
+                    if (terrain_node && terrain_node->get_owner() != root) {
+                        terrain_node->set_owner(root);
+                    }
+                }
+            }
+        }
+    }
+
+    // The terrain covers the same volume as the fluid grid. 1:1 mapping,
+    // same coordinate space — no offset or scale needed.
+
+    // Check that the terrain has a data source. Without a stream or generator,
+    // VoxelTool::copy will succeed but return empty/uninitialized voxels.
+    Variant stream_val = terrain->get("stream");
+    bool has_stream = (stream_val.get_type() != Variant::NIL);
+    Variant gen_val = terrain->get("generator");
+    bool has_generator = (gen_val.get_type() != Variant::NIL);
+    if (!has_stream && !has_generator) {
+        UtilityFunctions::printerr("FluidParticleSystem: child VoxelTerrain has no stream or generator set — ",
+                                   "VoxelTool::copy will return empty data. ",
+                                   "Set terrain_stream in the inspector.");
+    } else {
+        UtilityFunctions::print("FluidParticleSystem: terrain data source: ",
+                                has_stream ? "stream" : "",
+                                has_stream && has_generator ? " + " : "",
+                                has_generator ? "generator" : "");
+    }
+
+    // Extract the SDF from the terrain via get_voxel_tool().copy().
+    Variant vt_var = terrain->call("get_voxel_tool");
+    Object *vt = Object::cast_to<Object>(vt_var);
+    if (!vt) {
+        UtilityFunctions::printerr("FluidParticleSystem: get_voxel_tool() returned null.");
+        return sdf_storage_buf.is_valid();
+    }
+
+    // Check if the area is fully meshed (all blocks loaded + meshed).
+    // VoxelTool::copy reads from the in-memory block cache (same data the
+    // mesher uses). For blocks not yet streamed, it falls back to the
+    // generator. is_area_meshed tells us if streaming is complete.
+    AABB grid_aabb(Vector3(0, 0, 0),
+                   Vector3((float)grid_width, (float)grid_height, (float)grid_depth));
+    Variant meshed_ret = terrain->call("is_area_meshed", grid_aabb);
+    bool is_meshed = (bool)meshed_ret;
+    Variant editable_ret = vt->call("is_area_editable", grid_aabb);
+    bool is_editable = (bool)editable_ret;
+    UtilityFunctions::print("FluidParticleSystem: terrain area meshed=", is_meshed,
+                            " editable(loaded)=", is_editable,
+                            " for AABB ", grid_aabb);
+    if (!is_meshed) {
+        UtilityFunctions::printerr("FluidParticleSystem: terrain area is NOT fully meshed — \n",
+                                   "    VoxelTool::copy will use generator fallback for unloaded blocks.\n",
+                                   "    Wait for streaming to complete, or use full_load_mode.");
+    }
+
+    // Create a VoxelBuffer sized to the fluid grid.
+    Variant vb_var = ClassDB::instantiate("VoxelBuffer");
+    Object *vb = Object::cast_to<Object>(vb_var);
+    if (!vb) {
+        UtilityFunctions::printerr("FluidParticleSystem: cannot instantiate VoxelBuffer.");
+        return sdf_storage_buf.is_valid();
+    }
+    vb->call("create", grid_width, grid_height, grid_depth);
+    vb->call("set_channel_depth", 1, 2);  // CHANNEL_SDF=1, DEPTH_32_BIT=2
+
+    // vt.copy(src_pos, dst_buffer, channels_mask, with_metadata)
+    // channels_mask bit 1 = CHANNEL_SDF. Returns an Error (0 = OK).
+    int64_t grid_voxels = (int64_t)grid_width * grid_height * grid_depth;
+    Variant copy_ret = vt->call("copy", Vector3i(0, 0, 0), vb_var, 2, false);
+    int copy_err = (int)copy_ret;
+    if (copy_err != 0) {
+        UtilityFunctions::printerr("FluidParticleSystem: VoxelTool::copy failed with error ",
+                                   copy_err, " (requested ", grid_voxels,
+                                   " voxels = ", grid_width, "x", grid_height,
+                                   "x", grid_depth, ")");
+    } else {
+        UtilityFunctions::print("FluidParticleSystem: VoxelTool::copy OK — ",
+                                grid_voxels, " voxels (", grid_width, "x",
+                                grid_height, "x", grid_depth,
+                                ") copied from child terrain");
+    }
+
+    sdf_buffer_var = vb_var;
+    if (rd && gpu_ready) {
+        _upload_sdf_data();
+    }
+    UtilityFunctions::print("FluidParticleSystem: SDF extraction ",
+                            sdf_storage_buf.is_valid() ? "succeeded" : "FAILED",
+                            " — buffer ", sdf_w, "x", sdf_h, "x", sdf_d,
+                            " = ", (int64_t)sdf_w * sdf_h * sdf_d, " voxels");
+    return sdf_storage_buf.is_valid();
+}
+
+void FluidParticleSystem::_upload_sdf_data() {
+    if (sdf_buffer_var.get_type() == Variant::NIL) {
+        _free_local_rid(sdf_storage_buf);
+        sdf_w = sdf_h = sdf_d = 0;
+        return;
+    }
+
+    Object *vb = Object::cast_to<Object>(sdf_buffer_var);
+    if (!vb) {
+        UtilityFunctions::printerr("FluidParticleSystem: SDF buffer is not a valid Object.");
+        return;
+    }
+
+    // get_size() → Vector3i
+    Vector3i size = vb->call("get_size");
+    sdf_w = size.x;
+    sdf_h = size.y;
+    sdf_d = size.z;
+    if (sdf_w <= 0 || sdf_h <= 0 || sdf_d <= 0) {
+        UtilityFunctions::printerr("FluidParticleSystem: VoxelBuffer has invalid size.");
+        return;
+    }
+
+    // get_channel_depth(CHANNEL_SDF=1) → int (0=8bit, 1=16bit, 2=32bit, 3=64bit)
+    int64_t depth_val = vb->call("get_channel_depth", 1);
+    int depth = (int)depth_val;
+
+    // get_channel_as_byte_array(CHANNEL_SDF=1) → PackedByteArray (raw, ZXY order)
+    PackedByteArray raw = vb->call("get_channel_as_byte_array", 1);
+    if (raw.size() == 0) {
+        UtilityFunctions::printerr("FluidParticleSystem: VoxelBuffer SDF channel is empty.");
+        return;
+    }
+
+    int64_t voxel_count = (int64_t)sdf_w * sdf_h * sdf_d;
+    int64_t float_bytes = voxel_count * sizeof(float);
+
+    UtilityFunctions::print("FluidParticleSystem: uploading SDF — ", voxel_count,
+                            " voxels, ", float_bytes, " bytes (", raw.size(),
+                            " raw bytes, depth=", depth, ")");
+
+    // Decode into a local byte array. sdf_storage_buf is allocated once at
+    // grid size in _build_gpu_resources; we just buffer_update into it.
+    PackedByteArray staging;
+    staging.resize(float_bytes);
+    float *dst = reinterpret_cast<float *>(staging.ptrw());
+    const uint8_t *src = raw.ptr();
+
+    // Decode based on depth. godot_voxel quantization scales:
+    //   8-bit:  scale 0.1  → sdf = (raw/127) / 0.1 = (raw/127) * 10
+    //   16-bit: scale 0.002 → sdf = (raw/32767) / 0.002 = (raw/32767) * 500
+    //   32-bit: stored as raw float
+    //   64-bit: stored as raw double → downcast to float
+    // s8_to_snorm/s16_to_snorm clamp the low end to -1.
+    if (depth == 0) {
+        const int8_t *s8 = reinterpret_cast<const int8_t *>(src);
+        for (int64_t i = 0; i < voxel_count; i++) {
+            float v = std::max((float)s8[i] / 127.0f, -1.0f);
+            dst[i] = v * 10.0f;
+        }
+    } else if (depth == 1) {
+        const int16_t *s16 = reinterpret_cast<const int16_t *>(src);
+        for (int64_t i = 0; i < voxel_count; i++) {
+            float v = std::max((float)s16[i] / 32767.0f, -1.0f);
+            dst[i] = v * 500.0f;
+        }
+    } else if (depth == 2) {
+        std::memcpy(dst, src, float_bytes);
+    } else if (depth == 3) {
+        const double *d = reinterpret_cast<const double *>(src);
+        for (int64_t i = 0; i < voxel_count; i++) {
+            dst[i] = (float)d[i];
+        }
+    } else {
+        UtilityFunctions::printerr("FluidParticleSystem: unsupported SDF depth: ", depth);
+        return;
+    }
+
+    // Scan the decoded SDF for content statistics. This catches the case where
+    // copy() succeeded but returned empty/uninitialized data (e.g. terrain
+    // hasn't streamed its blocks yet).
+    float sdf_min = std::numeric_limits<float>::max();
+    float sdf_max = std::numeric_limits<float>::lowest();
+    double sdf_sum = 0.0;
+    int64_t solid_count = 0;   // sdf < 0 (inside terrain)
+    int64_t empty_count = 0;   // sdf > 0 (outside terrain)
+    int64_t zero_count = 0;    // sdf == 0 (surface or uninitialized)
+    for (int64_t i = 0; i < voxel_count; i++) {
+        float v = dst[i];
+        if (v < sdf_min) sdf_min = v;
+        if (v > sdf_max) sdf_max = v;
+        sdf_sum += (double)v;
+        if (v < 0.0f) solid_count++;
+        else if (v > 0.0f) empty_count++;
+        else zero_count++;
+    }
+    float sdf_mean = (float)(sdf_sum / (double)voxel_count);
+    UtilityFunctions::print("FluidParticleSystem: SDF content — min=", sdf_min,
+                            " max=", sdf_max, " mean=", sdf_mean,
+                            " solid(<0)=", solid_count,
+                            " empty(>0)=", empty_count,
+                            " zero(=0)=", zero_count,
+                            " / ", voxel_count, " voxels");
+    if (solid_count == 0 && zero_count == voxel_count) {
+        UtilityFunctions::printerr("FluidParticleSystem: SDF is entirely zero — ",
+                                   "terrain data has not loaded. ",
+                                   "Wait for streaming or check the stream/generator.");
+    }
+
+    if (!rd) return;
+
+    // Direct copy: decode into a local byte array and buffer_update into the
+    // existing sdf_storage_buf (allocated once at grid size in
+    // _build_gpu_resources). No reallocation, no staging buffer, no read-back.
+    if (sdf_storage_buf.is_valid()) {
+        rd->buffer_update(sdf_storage_buf, 0, float_bytes, staging);
+        UtilityFunctions::print("FluidParticleSystem: SDF buffer_update OK — ",
+                                float_bytes, " bytes written");
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

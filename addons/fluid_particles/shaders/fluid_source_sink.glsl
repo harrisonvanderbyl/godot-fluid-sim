@@ -42,13 +42,13 @@ struct ChunkCell {
     uint vel_x_bits;
     uint vel_y_bits;
     uint vel_z_bits;
-    uint vel_w_bits;
+    uint sdf_bits;      // SDF value at this cell (float bits). <0 = inside terrain.
     int  count;         // current occupancy
     uint _pad[2];
 };
 
 layout(set = 0, binding = 0, std430) buffer VertexBuffer { float vtx[]; };
-layout(set = 0, binding = 1, std430) buffer AttribBuffer { uint  atr[]; };
+layout(set = 0, binding = 1, std430) buffer AttribBuffer { vec4  atr[]; };
 layout(set = 0, binding = 2, std430) buffer ChunkBuffer  { ChunkCell cells[]; };
 
 vec3 get_position(int idx) {
@@ -59,13 +59,11 @@ void set_position(int idx, vec3 p) {
     int base = idx * pc.vertex_stride_floats;
     vtx[base + 0] = p.x; vtx[base + 1] = p.y; vtx[base + 2] = p.z;
 }
-void set_color(int idx, uint c) {
-    atr[idx * pc.attrib_stride_words + pc.color_offset_words] = c;
+void set_color(int idx, uint r, uint g, uint b, uint a) {
+    atr[idx * 2] = vec4(r, g, b, a);
 }
 void set_custom0(int idx, vec4 v) {
-    int base = idx * pc.attrib_stride_words + pc.custom0_offset_words;
-    atr[base+0] = floatBitsToUint(v.x); atr[base+1] = floatBitsToUint(v.y);
-    atr[base+2] = floatBitsToUint(v.z); atr[base+3] = floatBitsToUint(v.w);
+    atr[idx * 2 + 1] = v;
 }
 
 int cell_index(ivec3 p) {
@@ -155,7 +153,7 @@ void main() {
         uint cg = uint(clamp(pc.color.g * 255.0, 0.0, 255.0));
         uint cb = uint(clamp(pc.color.b * 255.0, 0.0, 255.0));
         uint ca = uint(clamp(pc.color.a * 255.0, 0.0, 255.0));
-        set_color(int(gid), cr | (cg << 8) | (cb << 16) | (ca << 24));
+        set_color(int(gid), cr,cg,cb,ca);
         set_custom0(int(gid), vec4(pc.attraction, pc.opacity_fade, 0.0, 0.0));
 
         // Claim the grid cell so the physics step sees this particle as occupied.

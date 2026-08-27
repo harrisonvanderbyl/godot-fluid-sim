@@ -28,11 +28,11 @@ layout(push_constant, std430) uniform PushConstants {
 // phase (solid/liquid) check. count is the real occupancy. For exact per-phase
 // counts you'd split count into count_solid/count_liquid here.
 struct ChunkCell {
-    int  occupant;      // representative particle idx, or -1 if empty         // ← NEW: current occupancy
+    int  occupant;      // representative particle idx, or -1 if empty
     uint vel_x_bits;
     uint vel_y_bits;
     uint vel_z_bits;
-    uint vel_w_bits;
+    uint sdf_bits;      // SDF value at this cell (float bits). <0 = inside terrain.
     int count;
     uint _pad[2];
 };
@@ -80,6 +80,25 @@ vec3 cell_read(int cidx) {
         uintBitsToFloat(cells[cidx].vel_z_bits)
     );
 }
+
+// Read the SDF value stored in a cell. <0 = inside terrain.
+float cell_sdf(int cidx) {
+    return uintBitsToFloat(cells[cidx].sdf_bits);
+}
+
+// Compute the SDF gradient (surface normal) at a cell via central differences.
+// Points toward increasing SDF (away from surface / outside).
+vec3 cell_sdf_normal(int cidx, ivec3 pos) {
+    float xp = cell_sdf(cell_index(pos + ivec3(1,0,0)));
+    float xm = cell_sdf(cell_index(pos - ivec3(1,0,0)));
+    float yp = cell_sdf(cell_index(pos + ivec3(0,1,0)));
+    float ym = cell_sdf(cell_index(pos - ivec3(0,1,0)));
+    float zp = cell_sdf(cell_index(pos + ivec3(0,0,1)));
+    float zm = cell_sdf(cell_index(pos - ivec3(0,0,1)));
+    vec3 g = vec3(xp - xm, yp - ym, zp - zm) * 0.5;
+    float l = length(g);
+    return (l > 0.0001) ? g / l : vec3(0.0, 1.0, 0.0);
+}
 vec3 cell_swap0(int cidx) {
     return vec3(
         uintBitsToFloat(atomicExchange(cells[cidx].vel_x_bits, 0u)),
@@ -97,22 +116,15 @@ void cell_atomic_add(int cidx, vec3 v) {
 // Try to join a cell. Returns true if admitted, and reports how full it was.
 // Atomic-add-then-back-out avoids the check-then-increment TOCTOU race:
 // unconditionally claim a slot, and if we overshot the max, release it.
-bool cell_try_join(int cidx, int pidx, int cap, out int prior_count) {
-    prior_count = atomicAdd(cells[cidx].count, 1);
-    if (prior_count >= cap) {
-        atomicAdd(cells[cidx].count, -1);   // back out, cell was full
-        return false;
-    }
+int cell_try_join(int cidx, int pidx, int cap, out int prior_count) {
     // We're in. Become the representative for phase checks (last writer wins;
     // approximate but only matters at phase boundaries).
-    atomicExchange(cells[cidx].occupant, pidx);
-    return true;
+    return atomicCompSwap(cells[cidx].occupant, -1, pidx) ;
 }
 
 // Leave a cell: decrement count. Clear representative only if the cell empties.
 void cell_leave(int cidx) {
-    int after = atomicAdd(cells[cidx].count, -1) - 1;
-    if (after <= 0) atomicCompSwap(cells[cidx].occupant, cells[cidx].occupant, -1);
+    atomicCompSwap(cells[cidx].occupant, cells[cidx].occupant, -1);
     // (representative left stale if count>0; harmless — it's only a phase hint)
 }
 
@@ -132,7 +144,6 @@ void main() {
     vec3 position = get_position(particle_idx);
     if (!(position.x == position.x)) return;   // NaN sentinel = inactive
 
-    uint color_packed = get_color(particle_idx);
     vec4 c0            = get_custom0(particle_idx);
     float attraction_force_val = c0.x;
     float opacity_fade         = c0.y;
@@ -140,8 +151,7 @@ void main() {
 
     if (opacity_fade < 1.0) opacity_fade += 1.0 / 60.0;
 
-    bool me_solid = ((color_packed >> 24) & 0xffu) > 200u;
-    int  my_cap   = me_solid ? 1 : pc.max_occupancy;   // solids never share
+    int  my_cap   = 1;   // solids never share
 
     // Container rigid-body impulse (inertia vs container motion).
     vec3 container_force = vec3(0.0);
@@ -155,11 +165,12 @@ void main() {
     if (length(container_force) > 0.0) opacity_fade = 1.0;
 
     bool  firststep    = false;
+    vec3 opos = position;
     ivec3 old_cell_pos = ivec3(round(position));
     int   old_cidx     = cell_index(old_cell_pos);
 
     // Ensure we're counted in our current cell.
-    if (cells[old_cidx].occupant == -1 || cells[old_cidx].count == 0) {
+    if (cells[old_cidx].occupant == -1) {
         int prior;
         cell_try_join(old_cidx, particle_idx, my_cap, prior);
         firststep = true;
@@ -179,22 +190,19 @@ void main() {
 
         // Harvest pooled momentum, divided by occupancy so N co-located
         // particles each take their 1/N share — conserves momentum on exit.
-        int occ_n = max(cells[ncidx].count, 1);
+    
         vec3 pooled = cell_swap0(ncidx);
-        momentum += pooled / float(occ_n);
+        
 
         int occ = cells[ncidx].occupant;
         if (occ >= 0 && occ < pc.num_particles) {
-            bool part_solid = ((get_color(occ) >> 24) & 0xffu) > 200u;
-            bool same_phase = (me_solid == part_solid);
-            allfilled += same_phase ? 1 : 0;
-            if (same_phase) cohesion += vec3(NEIGHBOR_OFFSETS[i]);
+            allfilled += 1;
+            cohesion -= vec3(NEIGHBOR_OFFSETS[i]);
 
             // Back-pressure: neighbor crowding pushes us the OTHER way.
             // Fills toward cap contribute an outward shove.
-            float fill = float(cells[ncidx].count) / float(max(my_cap, 1));
-            crowd -= vec3(NEIGHBOR_OFFSETS[i]) * max(fill - 1.0 + 1.0/float(max(my_cap,1)), 0.0);
         }
+        momentum += pooled;
     }
 
     float attract = attraction_force_val * pc.attraction_force;
@@ -216,7 +224,6 @@ void main() {
 
     if (firststep) attract = 0.0;
 
-    momentum -= pc.gravity; // assumed to be included in container force
     momentum += cohesion * pc.surface_tension;   // surface tension: pull toward the mass
     momentum += crowd    * pc.back_pressure;     // pressure: push out of crowded cells
 
@@ -231,7 +238,7 @@ void main() {
 
     // Boundary reflection (mirror fold; rest<1 damps).
     const float sz   = 1.0;
-    const float rest = 0.3;
+    const float rest = 0.4;
     {float lo = 1.0+sz, hi = float(pc.grid_h)-1.0-sz;
       if (position.y < lo) { position.y = lo + (lo-position.y)*rest; momentum.y = -momentum.y*rest; }
       else if (position.y > hi) { position.y = hi - (position.y-hi)*rest; momentum.y = -momentum.y*rest; } }
@@ -242,29 +249,79 @@ void main() {
       if (position.z < lo) { position.z = lo + (lo-position.z)*rest; momentum.z = -momentum.z*rest; }
       else if (position.z > hi) { position.z = hi - (position.z-hi)*rest; momentum.z = -momentum.z*rest; } }
 
+    // ── SDF terrain collision ──────────────────────────────────────────────
+    // Sample the SDF at the particle's new position. If inside terrain (sdf<0),
+    // push the particle out along the surface normal and reflect momentum.
+    {
+        ivec3 pcell = ivec3(round(position));
+        pcell = clamp(pcell, ivec3(0), ivec3(pc.grid_w-1, pc.grid_h-1, pc.grid_d-1));
+        int pcidx = cell_index(pcell);
+        float sdf = cell_sdf(pcidx);
+        if (sdf < 0.0) {
+            vec3 n = cell_sdf_normal(pcidx, pcell);
+            // Push out by the penetration depth along the normal.
+            position += n * (-sdf + 0.5);
+            // Reflect velocity component into the surface.
+            float vn = dot(momentum, n);
+            //momentum += n*0.5;
+            if (vn < 0.0) {
+                momentum -= n * vn * 1.5;  // reflect with restitution
+            }
+        }
+    }
+
     // Move to new cell if the rounded position changed.
     ivec3 new_cell_pos = ivec3(round(position));
     int   new_cidx     = cell_index(new_cell_pos);
     if (new_cell_pos != old_cell_pos) {
         int prior;
-        if (cell_try_join(new_cidx, particle_idx, my_cap, prior)) {
+        int oin = cell_try_join(new_cidx, particle_idx, my_cap, prior);
+        if (oin == -1) {
             cell_leave(old_cidx);            // only after we're admitted elsewhere
         } else {
             // Target cell full: stay put, dump our momentum into it as pressure.
-            position     = vec3(old_cell_pos);
-            cell_atomic_add(new_cidx, momentum);
-            momentum     = vec3(0.0);
+            position     = opos;
+            vec3 to_other = get_position(oin) - position;
+            float len_other = length(to_other);
+            float len_mom = length(momentum);
+            // Guard against normalize(zero) → NaN, which would propagate via
+            // cell_atomic_add and permanently infect the cell's velocity.
+            float tootherpos = 0.0;
+            if (len_other > 1e-6 && len_mom > 1e-6) {
+                tootherpos = dot(to_other / len_other, momentum / len_mom);
+            }
+            //momentum *= 0.2;
+            cell_atomic_add(new_cidx, momentum*tootherpos );
+            momentum     = momentum * (1.0-tootherpos);
             new_cell_pos = old_cell_pos;
         }
     }
 
     // Spread momentum to neighbors (shared pool → combined-system motion).
+    momentum -= pc.gravity; // assumed to be included in container force
+    
     vec3 spread = momentum * friction;
+    vec3 collected = vec3(0.0);
     for (int i = 0; i < n_size; i++) {
         ivec3 npos = new_cell_pos + NEIGHBOR_OFFSETS[i];
-        if (!in_bounds(npos)) continue;
-        cell_atomic_add(cell_index(npos), spread + vec3(NEIGHBOR_OFFSETS[i]) * attract);
+        if (in_bounds(npos) ) {
+            float direc = 1.0f;
+            vec3 ss = spread;
+            vec3 push = vec3(NEIGHBOR_OFFSETS[i]) * attract;
+            //if(dot(momentum,momentum)>0.0){
+              //  direc = (  1.0 * dot(normalize(NEIGHBOR_OFFSETS[i]), (momentum)));
+               // direc = max(0.0,direc);
+               // push = direc * push;
+            //}
+            cell_atomic_add(cell_index(npos), ss + push );
+        }else{
+            collected +=  vec3(NEIGHBOR_OFFSETS[i]) * attract + spread;
+        }
+        
+
     }
+
+    cell_atomic_add(cell_index(new_cell_pos), collected);
 
     set_position(particle_idx, position);
     set_custom0(particle_idx, vec4(attraction_force_val, opacity_fade, neighbors_filled, c0.w));

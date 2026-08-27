@@ -19,6 +19,7 @@
 #include <godot_cpp/variant/packed_int32_array.hpp>
 #include <godot_cpp/variant/packed_vector3_array.hpp>
 #include <godot_cpp/variant/packed_color_array.hpp>
+#include <godot_cpp/templates/hash_map.hpp>
 
 #include <vector>
 
@@ -29,7 +30,7 @@ namespace godot {
 // ──────────────────────────────────────────────────────────────────────────────
 struct GPUChunkCell {
     int32_t  occupant;
-    uint32_t vel_x_bits, vel_y_bits, vel_z_bits, vel_w_bits;
+    uint32_t vel_x_bits, vel_y_bits, vel_z_bits, sdf_bits;
     uint32_t _pad[3];
 };  // 32 bytes
 
@@ -100,6 +101,25 @@ public:
     void set_simulation_active(bool v) { simulation_active = v; }
     bool get_simulation_active()   const { return simulation_active; }
 
+    // ── SDF terrain collision ─────────────────────────────────────────────
+    // Connect a VoxelBuffer (from the godot_voxel addon) whose CHANNEL_SDF
+    // holds a signed distance field. When apply_sdf_to_velocity_field() is
+    // called (or reset_grid() while a buffer is set), the clear_grid shader
+    // bakes the SDF gradient (surface normal) into the persistent velocity
+    // field of the chunk grid. The physics shader then reads that velocity
+    // each frame, pushing particles out of the terrain — a collision-like
+    // reaction with no per-frame CPU work.
+    // Re-dispatch clear_grid, baking the SDF normals into the velocity field.
+    // No-op if no SDF buffer is connected or the GPU is not ready.
+    void   apply_sdf_to_velocity_field();
+    // Re-reads the connected VoxelBuffer's SDF channel (picks up terrain
+    // edits), uploads it to the GPU, then clears the grid and bakes the SDF
+    // normals into the velocity field. Exposed as an inspector button.
+    void   reload_sdf_and_clear_grid();
+    Callable get_reload_sdf_and_clear_grid() const {
+        return callable_mp(const_cast<FluidParticleSystem *>(this), &FluidParticleSystem::reload_sdf_and_clear_grid);
+    }
+
     // Initial chunk fill
     void set_use_initial_chunk(bool v) { use_initial_chunk = v; }
     bool get_use_initial_chunk()  const { return use_initial_chunk; }
@@ -128,6 +148,8 @@ public:
     Ref<ShaderMaterial> get_render_material() const;
 
     // Composite shader uniforms (Inspector-editable)
+    void set_fluid_particle_size(float v);
+    float get_fluid_particle_size() const { return fluid_particle_size; }
     void set_smooth_radius(float v);
     float get_smooth_radius() const { return smooth_radius; }
     void set_tint_strength(float v);
@@ -204,6 +226,14 @@ protected:
     // GDCLASS detects this by name, it is not a virtual on Object.
     void _notification(int p_what);
 
+    // Dynamic property forwarding for the child VoxelTerrain. Exposes all
+    // VoxelTerrain-specific properties on this node under a "Terrain" group
+    // with a "terrain_" prefix, so they can be edited in the inspector without
+    // selecting the internal child node. Values are cached so they survive
+    // child recreation and are applied when the child is created.
+    bool _set(const StringName &p_name, const Variant &p_value);
+    bool _get(const StringName &p_name, Variant &r_ret) const;
+
 private:
     // ── shader paths (Inspector-editable) ────────────────────────────────
     String clear_shader_path   = "res://addons/fluid_particles/shaders/clear_grid.glsl";
@@ -235,6 +265,7 @@ private:
     int   neighbor_mode   = 15;      // 6+center (reference uses 7)
     int   max_occupancy   = 1;       // max liquid particles per grid cell
     float back_pressure   = 0.0f;    // outward bias as a cell fills
+    float fluid_particle_size = 0.1f;  // composite shader uniform
 
     // ── simulation toggle ───────────────────────────────────────────────────
     bool  simulation_active = true;
@@ -245,6 +276,33 @@ private:
     Vector3i  initial_chunk_size      = Vector3i(64, 64, 64);
     Color     initial_chunk_color     = Color(1.0f, 1.0f, 1.0f, 1.0f);  // solid white
     float     initial_chunk_attraction = 1.0f;
+
+    // ── SDF terrain collision ─────────────────────────────────────────────
+    // VoxelBuffer reference (Variant because the godot_voxel addon is a
+    // separate GDExtension whose headers we don't link against — methods are
+    // called through Object::call). CHANNEL_SDF is read once, decoded to float
+    // and uploaded to sdf_storage_buf. The clear_grid shader samples it to
+    // bake the SDF gradient into the persistent chunk velocity field.
+    Variant sdf_buffer_var;
+    ObjectID voxel_terrain_child_id;  // child VoxelTerrain we instantiate
+    float sdf_strength = 1.0f;              // velocity push magnitude (unused now, kept for future)
+    // SDF storage buffer: float[grid_w * grid_h * grid_d], allocated once at
+    // grid size in _build_gpu_resources and never reallocated. _upload_sdf_data
+    // just buffer_update's into it. clear_grid.glsl reads it directly at binding 5.
+    RID     sdf_storage_buf;
+    int     sdf_w = 0, sdf_h = 0, sdf_d = 0;  // SDF buffer dimensions (for push constants)
+
+    // Cache of terrain property values set before the child VoxelTerrain
+    // exists (e.g. in the editor before _enter_tree). Applied to the child
+    // when it is created in _refresh_sdf_from_child.
+    HashMap<StringName, Variant> _terrain_property_cache;
+    Object *_get_voxel_terrain_child() const;
+
+    // Set by the block_loaded / mesh_block_entered signal callback. _process
+    // checks it and runs a debounced SDF recopy (re-extract + upload +
+    // clear_grid) so a burst of block loads doesn't trigger N recopies.
+    bool sdf_refresh_pending = false;
+    void _on_terrain_block_loaded(const Variant &p_position);
 
     // ── RenderingDevice ─────────────────────────────────────────────────────
     // A LOCAL RenderingDevice (created via create_local_rendering_device) that
@@ -422,6 +480,16 @@ private:
     void _destroy_sim_resources();
     void _rebuild_gpu_resources();
 
+    // ── SDF terrain collision ─────────────────────────────────────────────
+    // Read CHANNEL_SDF from the connected VoxelBuffer, decode it to float
+    // (handling 8/16/32-bit depths + quantization scales), and upload to a
+    // GPU storage buffer the clear_grid shader samples. No-op if no buffer.
+    void _upload_sdf_data();
+    // Instantiate a VoxelTerrain child sized to the fluid grid (if the
+    // godot_voxel addon is available) and extract its SDF into the chunk
+    // buffer's sdf_bits field. Returns true if an SDF buffer is available.
+    bool _refresh_sdf_from_child();
+
     // Sync pending GPU work on the local device (no-op if nothing submitted).
     void _sync_rd();
     // Reload a single compute shader by index: 0=clear, 1=physics, 2=sortkey.
@@ -429,7 +497,7 @@ private:
     // uniform_set/shader (in that order), and rebuilds them. On compile failure
     // the old shader is kept.
     void _reload_compute_shader(int which);
-    void _dispatch_clear_grid();
+    void _dispatch_clear_grid(bool keep_occupant = false);
     void _dispatch_physics(Vector3 global_add_velocity,
                            const Basis &delta_basis,
                            Vector3 delta_origin,

@@ -48,10 +48,10 @@ void smooth_fluid(vec2 uv, out vec3 color, out float depth, out float coverage) 
     float asum = 0.0;
     float dsum = 0.0;
     vec3  csum = vec3(0.0);
-    for (int j = -2; j <= 2; j++)
-    for (int i = -2; i <= 2; i++) {
+    for (int j = -5; j <= 5; j++)
+    for (int i = -5; i <= 5; i++) {
         float r2 = float(i*i + j*j);
-        if (r2 > 4.0) continue;                    // circular mask
+        if (r2 > 25.0) continue;                    // circular mask
         float rw  = exp(-r2 * smooth_falloff);     // radial dropoff
         vec2  ouv = uv + vec2(float(i), float(j)) * px;
         vec4  s   = texture(fluid_tex, ouv);
@@ -71,10 +71,10 @@ float smooth_fluid_depth(vec2 uv) {
     vec2  px   = fluid_pixel_size * smooth_radius;
     float asum = 0.0;
     float dsum = 0.0;
-    for (int j = -2; j <= 2; j++)
-    for (int i = -2; i <= 2; i++) {
+    for (int j = -5; j <= 5; j++)
+    for (int i = -5; i <= 5; i++) {
         float r2 = float(i*i + j*j);
-        if (r2 > 4.0) continue;
+        if (r2 > 25.0) continue;
         float rw  = exp(-r2 * smooth_falloff);
         vec2  ouv = uv + vec2(float(i), float(j)) * px;
         vec4  s   = texture(fluid_tex, ouv);
@@ -101,6 +101,9 @@ void fragment() {
     // Presence test AFTER the smooth kernel. Off-droplet taps have lowered the
     // coverage near the boundary, giving a soft anti-aliased edge instead of the
     // old hard per-tap cutoff.
+
+    float rs = refraction_strength;
+
     if (coverage < coverage_threshold) discard;
 
     // Fluid depth is standard-Z (0=near, 1=far). Reconstruct the fluid surface
@@ -121,7 +124,7 @@ void fragment() {
 
     // If the scene geometry is closer than the fluid, discard — let the scene
     // show through. (Reverse-Z: higher = closer.) Also after the kernel.
-    if (scene_ndc_z > fluid_ndc_z) discard;
+    //if (scene_ndc_z > fluid_ndc_z) discard;
 
     // ── Depth-based normal reconstruction ────────────────────────────────────
     // Neighbors use the same smoothing kernel as the center.
@@ -137,19 +140,29 @@ void fragment() {
     vec3 w_d = world_from_fluid(v_uv - vec2(0.0, npx.y), d_d);
 
     vec3 n_world = normalize(cross(w_r - w_l, w_u - w_d));
+    NORMAL = -n_world;
     if (dot(n_world, CAMERA_POSITION_WORLD - fluid_world) < 0.0) n_world = -n_world;
     vec3 n_view = normalize((VIEW_MATRIX * vec4(n_world, 0.0)).xyz);
 
     // Refraction: offset screen UV by the view-space normal's XY.
-    vec2 refract_uv = clamp(SCREEN_UV + n_view.xy * refraction_strength,
+    vec2 refract_uv = clamp(SCREEN_UV + n_view.xy * rs,
                             vec2(0.0), vec2(1.0));
     vec3 screen_col = textureLod(screen_tex, refract_uv, 0.0).rgb;
 
     // Thickness from NDC depth difference.
-    float thickness = max(scene_ndc_z - fluid_ndc_z, 0.0);
-    float tint = tint_strength * exp(-thickness / max(absorption_dist, 0.001));
-
-    ALBEDO = mix(screen_col, screen_col * col, tint);
+    
+    // 2. Convert Screen UV and Depth into Normalized Device Coordinates (NDC)
+    // Map X/Y from [0, 1] to [-1, 1]
+    vec3 ndca = vec3(SCREEN_UV * 2.0 - 1.0, scene_ndc_z);
+    
+    // 3. Convert NDC to View Space, then to World Space
+    vec4 worlda = INV_VIEW_MATRIX * INV_PROJECTION_MATRIX * vec4(ndca, 1.0);
+    
+    // 4. Perform perspective divide to get the actual 3D coordinates
+    vec3 world_position = worlda.xyz / worlda.w;
+    float thickness = distance(world_position,fluid_world)/10.0;
+    float absorb = tint_strength * (1.0 - exp(-thickness / max(absorption_dist, 1e-3)));
+    ALBEDO = mix(screen_col, screen_col * col, absorb);
     ALPHA = 1.0;
 
     // Write the reprojected fluid depth (matches scene depth buffer format).

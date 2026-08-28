@@ -284,7 +284,14 @@ private:
     // and uploaded to sdf_storage_buf. The clear_grid shader samples it to
     // bake the SDF gradient into the persistent chunk velocity field.
     Variant sdf_buffer_var;
-    ObjectID voxel_terrain_child_id;  // child VoxelTerrain we instantiate
+    // Terrain child supplying the SDF data. P1 swaps this to VoxelLodTerrain
+    // (forced to a single LOD so output matches the old VoxelTerrain setup);
+    // a legacy VoxelTerrain is still accepted/created as a fallback. The node
+    // is godot_voxel (separate GDExtension), so all access goes through
+    // Object::call / Object::set / Object::get.
+    ObjectID voxel_terrain_child_id;
+    bool terrain_is_vlt = false;  // child is a VoxelLodTerrain (not legacy VoxelTerrain)
+    bool terrain_no_signal_warned = false;  // one-time "no block signals" memo
     float sdf_strength = 1.0f;              // velocity push magnitude (unused now, kept for future)
     // SDF storage buffer: float[grid_w * grid_h * grid_d], allocated once at
     // grid size in _build_gpu_resources and never reallocated. _upload_sdf_data
@@ -302,7 +309,15 @@ private:
     // checks it and runs a debounced SDF recopy (re-extract + upload +
     // clear_grid) so a burst of block loads doesn't trigger N recopies.
     bool sdf_refresh_pending = false;
-    void _on_terrain_block_loaded(const Variant &p_position);
+    // Cached arity of the terrain block signals (1 or 2 args). Probed from
+    // get_signal_list() at connect time; -1 = not probed yet / not available.
+    int  terrain_signal_arity = -1;
+    // Throttled terrain event log (land/unload spam would flood the output).
+    uint64_t terrain_event_log_last_ms = 0;
+    uint32_t terrain_event_log_count = 0;
+    void _on_terrain_block_loaded(const Variant &a, const Variant &b, const Variant &c, const Variant &d);
+    void _on_terrain_block_unloaded(const Variant &a, const Variant &b, const Variant &c, const Variant &d);
+    void _on_terrain_block_event(const Variant &p_position, bool p_entered);
 
     // ── RenderingDevice ─────────────────────────────────────────────────────
     // A LOCAL RenderingDevice (created via create_local_rendering_device) that

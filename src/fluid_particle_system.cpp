@@ -22,6 +22,10 @@
 #include <godot_cpp/classes/plane_mesh.hpp>
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/core/memory.hpp>
+#include <godot_cpp/classes/time.hpp>
+#include <godot_cpp/classes/engine.hpp>
+#include <godot_cpp/classes/scene_tree.hpp>
+#include <godot_cpp/classes/node.hpp>
 #include <cstring>
 #include <cmath>
 #include <limits>
@@ -209,10 +213,16 @@ void FluidParticleSystem::_bind_methods() {
                          &FluidParticleSystem::reload_sdf_and_clear_grid);
     ClassDB::bind_method(D_METHOD("get_reload_sdf_and_clear_grid"),
                          &FluidParticleSystem::get_reload_sdf_and_clear_grid);
-    // Internal — signal callback from VoxelTerrain, not exposed in inspector.
-    // Takes a Variant (the block position Vector3i) which we ignore.
-    ClassDB::bind_method(D_METHOD("_on_terrain_block_loaded", "position"),
-                         &FluidParticleSystem::_on_terrain_block_loaded);
+    // Internal — signal callbacks from the terrain node, not exposed in the
+    // inspector. Trailing DEFVAL args make them callable with 1, 2, 3 or 4
+    // args, so one signature fits both the legacy 1-arg emitters (position)
+    // and 2-arg position+lod emitters without arity errors.
+    ClassDB::bind_method(D_METHOD("_on_terrain_block_loaded", "position", "b", "c", "d"),
+                         &FluidParticleSystem::_on_terrain_block_loaded,
+                         DEFVAL(0), DEFVAL(0), DEFVAL(0));
+    ClassDB::bind_method(D_METHOD("_on_terrain_block_unloaded", "position", "b", "c", "d"),
+                         &FluidParticleSystem::_on_terrain_block_unloaded,
+                         DEFVAL(0), DEFVAL(0), DEFVAL(0));
 
     // ── Inspector layout ───────────────────────────────────────────────────
     // Reload button at the top for quick iteration.
@@ -1272,8 +1282,8 @@ void FluidParticleSystem::_enter_tree() {
     _build_gpu_resources();
     _ensure_rd_render_pipeline();
 
-    // Instantiate a VoxelTerrain child sized to the fluid grid and extract
-    // its SDF into the chunk buffer.
+    // Instantiate a VoxelLodTerrain child (forced to a single LOD for P1)
+    // sized to the fluid grid and extract its SDF into the chunk buffer.
     _refresh_sdf_from_child();
 
     // Bake the SDF (now in sdf_storage_buf) into the chunk grid's sdf_bits
@@ -2093,50 +2103,91 @@ bool FluidParticleSystem::_get(const StringName &p_name, Variant &r_ret) const {
 }
 
 
-// Signal callback from VoxelTerrain (block_loaded / mesh_block_entered).
-// Just sets a flag — _process does the debounced recopy so a burst of block
-// loads doesn't trigger N GPU dispatches.
-void FluidParticleSystem::_on_terrain_block_loaded(const Variant &p_position) {
+// ─────────────────────────────────────────────────────────────────────────────
+// Signal callbacks from the terrain node. Bound with 4 Variant params so a
+// single signature works for 1-arg (legacy position-only) and 2-arg
+// (position+lod) emitters both — extra args cut off, none appended (godot-cpp
+// bind_method has no default-arg support for this case; arity mismatch is not
+// an error, signals pass what they have).
+// Both just set a flag — _process does the debounced recopy so a burst of
+// block events doesn't trigger N GPU dispatches.
+// ─────────────────────────────────────────────────────────────────────────────
+void FluidParticleSystem::_on_terrain_block_loaded(const Variant &a, const Variant &b,
+                                                   const Variant &c, const Variant &d) {
+    _on_terrain_block_event(a, true);
+}
+
+void FluidParticleSystem::_on_terrain_block_unloaded(const Variant &a, const Variant &b,
+                                                     const Variant &c, const Variant &d) {
+    _on_terrain_block_event(a, false);
+}
+
+void FluidParticleSystem::_on_terrain_block_event(const Variant &p_position, bool p_entered) {
     sdf_refresh_pending = true;
+    // Throttled event log: first event logs immediately, then at most one line
+    // per 2 s summarizing how many events occurred in between. Keeps streaming
+    // feedback visible without flooding the output.
+    const uint64_t now = (uint64_t)Time::get_singleton()->get_ticks_msec();
+    if (terrain_event_log_last_ms == 0) {
+        UtilityFunctions::print("FluidParticleSystem: terrain ",
+                                p_entered ? "block_loaded/mesh_block_entered" : "block_unloaded/mesh_block_exited",
+                                " at ", p_position);
+        terrain_event_log_last_ms = now;
+        terrain_event_log_count = 0;
+        return;
+    }
+    ++terrain_event_log_count;
+    if (now - terrain_event_log_last_ms >= 2000) {
+        UtilityFunctions::print("FluidParticleSystem: terrain events x",
+                                terrain_event_log_count, " in last 2s (suppressing repeats)");
+        terrain_event_log_last_ms = now;
+        terrain_event_log_count = 0;
+    }
 }
 
 bool FluidParticleSystem::_refresh_sdf_from_child() {
-    // Instantiate a VoxelTerrain child if we don't have one yet. VoxelTerrain
-    // is from the godot_voxel addon (separate GDExtension), so we create it
-    // by class name via ClassDB.
+    // Instantiate a terrain child if we don't have one yet. P1 targets
+    // VoxelLodTerrain (godot_voxel's variable-LOD node); a legacy fixed
+    // VoxelTerrain is still adopted/created as a fallback. The node comes
+    // from the godot_voxel addon (separate GDExtension), so we create it by
+    // class name via ClassDB.
     Object *terrain = nullptr;
     if (voxel_terrain_child_id.is_valid()) {
         terrain = Object::cast_to<Object>(ObjectDB::get_instance(voxel_terrain_child_id));
     }
     if (!terrain) {
-        // see if has child with class type VoxelTerrain
+        // see if has child with either terrain class
         for (int i = 0; i < get_child_count(); i++) {
             Object *child = get_child(i);
-            if (child && child->is_class("VoxelTerrain")) {
+            if (child && (child->is_class("VoxelLodTerrain") || child->is_class("VoxelTerrain"))) {
                 terrain = child;
                 voxel_terrain_child_id = terrain->get_instance_id();
-                
-                terrain->connect("block_loaded",
-                        Callable(this, "_on_terrain_block_loaded"));
-                terrain->connect("mesh_block_entered",
-                        Callable(this, "_on_terrain_block_loaded"));
                 break;
             }
         }
     }
     if (!terrain) {
-        Variant v = ClassDB::instantiate("VoxelTerrain");
+        // Prefer VoxelLodTerrain; fall back to legacy VoxelTerrain.
+        Variant v = ClassDB::instantiate("VoxelLodTerrain");
         terrain = Object::cast_to<Object>(v);
+        String terrain_class_name = "VoxelLodTerrain";
         if (!terrain) {
-            UtilityFunctions::printerr("FluidParticleSystem: VoxelTerrain class not found. Is the godot_voxel addon enabled?");
+            UtilityFunctions::print("FluidParticleSystem: VoxelLodTerrain not available, falling back to VoxelTerrain.");
+            terrain_class_name = "VoxelTerrain";
+            v = ClassDB::instantiate(terrain_class_name);
+            terrain = Object::cast_to<Object>(v);
+        }
+        if (!terrain) {
+            UtilityFunctions::printerr("FluidParticleSystem: neither VoxelLodTerrain nor VoxelTerrain class found. Is the godot_voxel addon enabled?");
             return false;
         }
         // Add as child so it enters the tree and starts generating.
         Node *terrain_node = Object::cast_to<Node>(terrain);
         if (terrain_node) {
-            terrain_node->set_name("VoxelTerrain");
+            terrain_node->set_name(terrain_class_name);
             add_child(terrain_node);
             voxel_terrain_child_id = terrain_node->get_instance_id();
+            terrain_is_vlt = (terrain_class_name == "VoxelLodTerrain");
             // In the editor, set the owner to the edited scene root so the
             // child shows up in the scene tree dock and can be selected/edited
             // directly. At runtime the owner stays null (no scene tree dock).
@@ -2151,25 +2202,99 @@ bool FluidParticleSystem::_refresh_sdf_from_child() {
             for (const auto &E : _terrain_property_cache) {
                 terrain->set(E.key, E.value);
             }
-            // Connect block_loaded + mesh_block_entered so we recopy the SDF
-            // when the terrain streams in new data. The callback just sets a
-            // flag; _process does the debounced recopy.
-            terrain->connect("block_loaded",
-                    Callable(this, "_on_terrain_block_loaded"));
-            terrain->connect("mesh_block_entered",
-                    Callable(this, "_on_terrain_block_loaded"));
         }
-    }else{
+    } else {
+        // Adopted an existing child: remember its class and fix up owner.
+        terrain_is_vlt = terrain->is_class("VoxelLodTerrain");
         if (Engine::get_singleton()->is_editor_hint()) {
             if (SceneTree *tree = get_tree()) {
                 if (Node *root = tree->get_edited_scene_root()) {
-                    
                     Node *terrain_node = Object::cast_to<Node>(terrain);
                     if (terrain_node && terrain_node->get_owner() != root) {
                         terrain_node->set_owner(root);
                     }
                 }
             }
+        }
+    }
+
+    // Force a single-LOD configuration on the VLT so the streamed data and
+    // SDF extraction see the same full-resolution volume the fixed
+    // VoxelTerrain provided (P1 acceptance: observably identical behavior).
+    // lod_count=1 is valid upstream (set_lod_count only rejects < 1). Mesh
+    // block size is pinned to 16 so voxel_to_*_block_position math matches
+    // the fluid grid's 16³ pitch; data block size is already 16 upstream.
+    if (terrain_is_vlt) {
+        Variant lod_count_ret = terrain->get("lod_count");
+        if ((int)lod_count_ret != 1) {
+            terrain->set("lod_count", 1);
+        }
+        Variant mbs_ret = terrain->get("mesh_block_size");
+        if ((int)mbs_ret != 16) {
+            terrain->set("mesh_block_size", 16);
+        }
+        UtilityFunctions::print("FluidParticleSystem: VoxelLodTerrain configured lod_count=", (int)terrain->get("lod_count"),
+                                " mesh_block_size=", (int)terrain->get("mesh_block_size"));
+    }
+
+    // Connect block signals so we recopy the SDF when the terrain streams in
+    // new data. The callback just sets a flag; _process does the debounced
+    // recopy. NOTE: upstream master VoxelLodTerrain does NOT register block
+    // signals (they belong to fixed VoxelTerrain), so we probe the live node's
+    // get_signal_list() and connect whichever of the four known names exist.
+    // If none exist we log it once — SDF refresh then relies on the initial
+    // copy plus manual reload_sdf_and_clear_grid() until LOD-tier signals
+    // land upstream.
+    {
+        // Probe the live node's registered signals; connect each known name at
+        // most once (is_connected guard). Re-refresh on the same terrain is
+        // the common path, so the per-terrain "no signals" warning must not
+        // spam — hence the header-stored memo.
+        Array signal_list = terrain->call("get_signal_list");
+        const char *load_names[] = { "block_loaded", "mesh_block_entered" };
+        const char *unload_names[] = { "block_unloaded", "mesh_block_exited" };
+        bool connected_any = false;
+        terrain_signal_arity = -1;
+        for (const char *name : load_names) {
+            for (int si = 0; si < signal_list.size(); ++si) {
+                Dictionary sig = signal_list[si];
+                String sig_name = sig.get("name", String());
+                if (sig_name != String(name)) {
+                    continue;
+                }
+                // Cache arity from the signal's args list.
+                Array sig_args = sig.get("args", Array());
+                terrain_signal_arity = sig_args.size() > 0 ? (int)sig_args.size() : 1;
+                if (!terrain->is_connected(name, Callable(this, "_on_terrain_block_loaded"))) {
+                    terrain->connect(name, Callable(this, "_on_terrain_block_loaded"));
+                }
+                connected_any = true;
+                break;
+            }
+        }
+        for (const char *name : unload_names) {
+            for (int si = 0; si < signal_list.size(); si++) {
+                Dictionary sig = signal_list[si];
+                String sig_name = sig.get("name", String());
+                if (sig_name != String(name)) {
+                    continue;
+                }
+                if (!terrain->is_connected(name, Callable(this, "_on_terrain_block_unloaded"))) {
+                    terrain->connect(name, Callable(this, "_on_terrain_block_unloaded"));
+                }
+                connected_any = true;
+                break;
+            }
+        }
+        if (connected_any) {
+            UtilityFunctions::print("FluidParticleSystem: connected terrain block signals (arity=",
+                                    terrain_signal_arity, ") on ",
+                                    terrain_is_vlt ? "VoxelLodTerrain" : "VoxelTerrain");
+        } else if (!terrain_no_signal_warned) {
+            UtilityFunctions::print("FluidParticleSystem: no block signals registered on terrain node (",
+                                    terrain_is_vlt ? "VoxelLodTerrain" : "VoxelTerrain",
+                                    ") — SDF auto-refresh unavailable; call reload_sdf_and_clear_grid() after edits.");
+            terrain_no_signal_warned = true;
         }
     }
 
@@ -2183,7 +2308,7 @@ bool FluidParticleSystem::_refresh_sdf_from_child() {
     Variant gen_val = terrain->get("generator");
     bool has_generator = (gen_val.get_type() != Variant::NIL);
     if (!has_stream && !has_generator) {
-        UtilityFunctions::printerr("FluidParticleSystem: child VoxelTerrain has no stream or generator set — ",
+        UtilityFunctions::printerr("FluidParticleSystem: terrain child has no stream or generator set — ",
                                    "VoxelTool::copy will return empty data. ",
                                    "Set terrain_stream in the inspector.");
     } else {
@@ -2205,9 +2330,12 @@ bool FluidParticleSystem::_refresh_sdf_from_child() {
     // VoxelTool::copy reads from the in-memory block cache (same data the
     // mesher uses). For blocks not yet streamed, it falls back to the
     // generator. is_area_meshed tells us if streaming is complete.
+    // VLT's binding takes (AABB, lod_index); legacy VoxelTerrain takes (AABB).
     AABB grid_aabb(Vector3(0, 0, 0),
                    Vector3((float)grid_width, (float)grid_height, (float)grid_depth));
-    Variant meshed_ret = terrain->call("is_area_meshed", grid_aabb);
+    Variant meshed_ret = terrain_is_vlt
+        ? terrain->call("is_area_meshed", grid_aabb, 0)
+        : terrain->call("is_area_meshed", grid_aabb);
     bool is_meshed = (bool)meshed_ret;
     Variant editable_ret = vt->call("is_area_editable", grid_aabb);
     bool is_editable = (bool)editable_ret;

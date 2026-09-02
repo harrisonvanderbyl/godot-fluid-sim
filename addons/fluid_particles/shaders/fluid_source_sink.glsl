@@ -34,22 +34,72 @@ layout(push_constant, std430) uniform PushConstants {
     int   attrib_stride_words;
     int   color_offset_words;
     int   custom0_offset_words;
+    int   lod_levels;    // number of LOD levels in the page table
+    int   _pad[3];       // pad to 96 bytes (16-byte aligned)
 } pc;
 
-// MUST match ChunkCell in velocity_spread.glsl (std430, 32 bytes).
-struct ChunkCell {
-    int  occupant;      // representative particle idx, or -1 if empty
+// MUST match ArenaCell in velocity_spread.glsl (std430, 32 bytes).
+struct ArenaCell {
+    int  occupant;
     uint vel_x_bits;
     uint vel_y_bits;
     uint vel_z_bits;
-    uint sdf_bits;      // SDF value at this cell (float bits). <0 = inside terrain.
-    int  count;         // current occupancy
-    uint _pad[2];
+    uint sdf_bits;
+    int  count;
+    uint pad0;
+    uint pad1;
 };
 
-layout(set = 0, binding = 0, std430) buffer VertexBuffer { float vtx[]; };
-layout(set = 0, binding = 1, std430) buffer AttribBuffer { vec4  atr[]; };
-layout(set = 0, binding = 2, std430) buffer ChunkBuffer  { ChunkCell cells[]; };
+layout(set = 0, binding = 0, std430) buffer VertexBuffer   { float vtx[]; };
+layout(set = 0, binding = 1, std430) buffer AttribBuffer   { uint  atr[]; };
+// Legacy dense chunk grid — declared for uniform-set layout compat but not read.
+layout(set = 0, binding = 2, std430) buffer LegacyChunkBuffer { float legacy_chunk[]; };
+
+// Paged arena + LOD page table (same bindings as velocity_spread.glsl).
+layout(set = 0, binding = 6, std430) buffer ArenaBuffer    { ArenaCell acells[]; };
+layout(set = 0, binding = 7, std430) buffer LodTableBuffer { uint ltab[]; };
+
+// Page-table field helpers (mirror velocity_spread.glsl).
+uint lt_cell_base(int tidx) { return ltab[(tidx << 2) + 0]; }
+uint lt_flags(int tidx)     { return ltab[(tidx << 2) + 1]; }
+
+// Page-table dims for LOD k (mirror velocity_spread.glsl table_block_stride).
+int table_block_stride(int k) {
+    const int pv = 16 << k;
+    return ((pc.grid_w + pv - 1) / pv) *
+           ((pc.grid_h + pv - 1) / pv) *
+           ((pc.grid_d + pv - 1) / pv);
+}
+
+// Page-table entry index for a voxel position at LOD k, or -1 if OOB.
+int table_index(int k, ivec3 vp) {
+    const int pv = 16 << k;
+    const int dw = (pc.grid_w + pv - 1) / pv;
+    const int dh = (pc.grid_h + pv - 1) / pv;
+    const int dd = (pc.grid_d + pv - 1) / pv;
+    const ivec3 pp = vp >> (4 + k);
+    if (pp.x < 0 || pp.y < 0 || pp.z < 0 || pp.x >= dw || pp.y >= dh || pp.z >= dd) {
+        return -1;
+    }
+    int base = 0;
+    for (int q = 0; q < k; ++q) {
+        base += table_block_stride(q);
+    }
+    return base + pp.x + dw * (pp.y + dh * pp.z);
+}
+
+// Resolve the arena cell index for a voxel position: finest allocated page wins.
+int resolve_cell(ivec3 vp) {
+    for (int k = 0; k < pc.lod_levels; ++k) {
+        const int tidx = table_index(k, vp);
+        if (tidx < 0) continue;
+        if ((lt_flags(tidx) & 1u) != 0u) {
+            const ivec3 lc = (vp >> k) & 15;
+            return int(lt_cell_base(tidx)) + lc.x + lc.y * 16 + lc.z * 256;
+        }
+    }
+    return -1;
+}
 
 vec3 get_position(int idx) {
     int base = idx * pc.vertex_stride_floats;
@@ -60,42 +110,21 @@ void set_position(int idx, vec3 p) {
     vtx[base + 0] = p.x; vtx[base + 1] = p.y; vtx[base + 2] = p.z;
 }
 void set_color(int idx, uint r, uint g, uint b, uint a) {
-    atr[idx * 2] = vec4(r, g, b, a);
+    atr[idx * pc.attrib_stride_words + pc.color_offset_words] =
+        r | (g << 8) | (b << 16) | (a << 24);
 }
 void set_custom0(int idx, vec4 v) {
-    atr[idx * 2 + 1] = v;
+    int base = idx * pc.attrib_stride_words + pc.custom0_offset_words;
+    atr[base+0] = floatBitsToUint(v.x); atr[base+1] = floatBitsToUint(v.y);
+    atr[base+2] = floatBitsToUint(v.z); atr[base+3] = floatBitsToUint(v.w);
 }
 
-int cell_index(ivec3 p) {
-    p = clamp(p, ivec3(0), ivec3(pc.grid_w - 1, pc.grid_h - 1, pc.grid_d - 1));
-    return p.x + p.y * pc.grid_w + p.z * pc.grid_w * pc.grid_h;
+// Arena cell helpers (mirror velocity_spread.glsl ac_try_join / ac_leave).
+int ac_try_join(int cidx, int pidx) {
+    return atomicCompSwap(acells[cidx].occupant, -1, pidx);
 }
-
-// Claim an empty cell for a newly-spawned particle. Mirrors the join half of
-// cell_try_join from velocity_spread.glsl: set occupant, then increment count.
-bool cell_try_place(int cidx, int pidx) {
-    if (atomicCompSwap(cells[cidx].occupant, -1, pidx) != -1) return false;
-    atomicAdd(cells[cidx].count, 1);
-    return true;
-}
-
-// Release a cell from a sunk particle. Mirrors cell_leave from
-// velocity_spread.glsl (decrement count, clear representative if the cell
-// empties) and additionally drains the pooled velocity field so orphaned
-// momentum doesn't create a ghost puff toward the now-empty cell on the next
-// physics step.
-void cell_leave_and_drain(int cidx) {
-    int after = atomicAdd(cells[cidx].count, -1) - 1;
-    if (after <= 0) {
-        // Cell is empty — clear the representative occupant (CAS against the
-        // current value, matching cell_leave in velocity_spread.glsl).
-        atomicCompSwap(cells[cidx].occupant, cells[cidx].occupant, -1);
-        // Drain the pooled velocity so a neighbor doesn't harvest a velocity
-        // spike from an empty cell next frame.
-        atomicExchange(cells[cidx].vel_x_bits, 0u);
-        atomicExchange(cells[cidx].vel_y_bits, 0u);
-        atomicExchange(cells[cidx].vel_z_bits, 0u);
-    }
+void ac_leave(int cidx, int pidx) {
+    atomicCompSwap(acells[cidx].occupant, pidx, -1);
 }
 
 // Shared atomic counter — how many particles we've claimed/released this dispatch
@@ -156,11 +185,12 @@ void main() {
         set_color(int(gid), cr,cg,cb,ca);
         set_custom0(int(gid), vec4(pc.attraction, pc.opacity_fade, 0.0, 0.0));
 
-        // Claim the grid cell so the physics step sees this particle as occupied.
-        // If the cell is already taken, release the particle back to the inactive
-        // pool rather than overlapping another occupant.
+        // Claim the arena cell so the physics step sees this particle as
+        // occupied. If the cell is already taken or has no allocated page,
+        // release the particle back to the inactive pool.
         ivec3 cell_pos = ivec3(round(new_pos));
-        if (!cell_try_place(cell_index(cell_pos), int(gid))) {
+        int cidx = resolve_cell(cell_pos);
+        if (cidx < 0 || ac_try_join(cidx, int(gid)) != -1) {
             set_inactive(int(gid));
         }
 
@@ -174,12 +204,14 @@ void main() {
         int slot = atomicAdd(s_claimed, 1);
         if (slot >= pc.max_count) return;
 
-        // Free the grid cell so other particles can move into the vacated
-        // location: decrement count, clear the representative occupant if the
-        // cell empties, and drain the pooled velocity field.
+        // Free the arena cell so other particles can move into the vacated
+        // location. resolve_cell finds the page; ac_leave clears our occupant
+        // slot only if it still points at us.
         ivec3 cell_pos = ivec3(round(get_position(int(gid))));
-        int   cidx     = cell_index(cell_pos);
-        cell_leave_and_drain(cidx);
+        int   cidx     = resolve_cell(cell_pos);
+        if (cidx >= 0) {
+            ac_leave(cidx, int(gid));
+        }
 
         set_inactive(int(gid));
     }

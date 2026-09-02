@@ -77,8 +77,11 @@ float sample_sdf(ivec3 pos) {
 // ─────────────────────────────────────────────────────────────────────────────
 void main() {
     uint gid = gl_GlobalInvocationID.x;
-    uint cell_count = uint(pc.grid_w) * uint(pc.grid_h) * uint(pc.grid_d);
-    if (gid >= cell_count) return;
+    // chunk_buf is only LOD_PAGE_CELLS (4096) cells — the LOD arena owns
+    // the real cell storage. This shader's writes are dead (physics reads
+    // SDF from sdf_storage_buf at binding 5), but we still guard against
+    // out-of-bounds writes.
+    if (gid >= 4096u) return;
 
     // Only clear occupant on a full reset, not on a velocity-only reload.
     if (pc.sdf_keep_occupant < 0.5) {

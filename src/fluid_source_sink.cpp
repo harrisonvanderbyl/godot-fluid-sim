@@ -27,6 +27,8 @@ struct SourceSinkPC {
     int32_t attrib_stride_words;
     int32_t color_offset_words;
     int32_t custom0_offset_words;
+    int32_t lod_levels;
+    int32_t _pad[3];   // pad to 96 bytes (16-byte aligned)
 };
 
 static_assert(sizeof(SourceSinkPC) % 16 == 0,
@@ -160,6 +162,8 @@ void FluidSourceBase::_build_pipeline(FluidParticleSystem *ps) {
     RID particle_buf  = ps->get_vertex_buf();
     RID attribute_buf = ps->get_attribute_buf();
     RID chunk_buf     = ps->get_chunk_buf();
+    RID arena_buf     = ps->get_cell_arena_buf();
+    RID lod_table_buf = ps->get_lod_table_buf();
     if (!particle_buf.is_valid() || !attribute_buf.is_valid() || !chunk_buf.is_valid()) {
         UtilityFunctions::printerr("FluidSource/Sink: parent buffers not ready.");
         return;
@@ -208,6 +212,9 @@ void FluidSourceBase::_build_pipeline(FluidParticleSystem *ps) {
     uniforms.append(make_storage_uniform(particle_buf,  0));
     uniforms.append(make_storage_uniform(attribute_buf, 1));
     uniforms.append(make_storage_uniform(chunk_buf,     2));
+    // Arena + LOD page table (same bindings as velocity_spread.glsl).
+    if (arena_buf.is_valid())     uniforms.append(make_storage_uniform(arena_buf,     6));
+    if (lod_table_buf.is_valid()) uniforms.append(make_storage_uniform(lod_table_buf, 7));
     uniform_set = rd->uniform_set_create(uniforms, shader_rid, 0);
     if (!uniform_set.is_valid()) {
         UtilityFunctions::printerr("FluidSource/Sink: failed to create uniform set.");
@@ -276,6 +283,7 @@ void FluidSourceBase::_dispatch(FluidParticleSystem *ps) {
     pc.attrib_stride_words  = ps->get_attrib_stride_words();
     pc.color_offset_words   = ps->get_color_offset_words();
     pc.custom0_offset_words = ps->get_custom0_offset_words();
+    pc.lod_levels    = ps->get_lod_levels();
 
     // Fill source-specific attributes (subclass overrides for sink, but the
     // values are ignored by the shader in sink mode)

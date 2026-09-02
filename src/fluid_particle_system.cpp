@@ -1,5 +1,6 @@
 #include "fluid_particle_system.hpp"
 #include "fluid_source_sink.hpp"
+#include "lod_arena.hpp"
 
 #include <godot_cpp/classes/rendering_server.hpp>
 #include <godot_cpp/classes/rd_shader_spirv.hpp>
@@ -13,6 +14,7 @@
 #include <godot_cpp/classes/rd_pipeline_color_blend_state.hpp>
 #include <godot_cpp/classes/rd_pipeline_color_blend_state_attachment.hpp>
 #include <godot_cpp/classes/file_access.hpp>
+#include <godot_cpp/classes/dir_access.hpp>
 #include <godot_cpp/classes/resource_loader.hpp>
 #include <godot_cpp/classes/immediate_mesh.hpp>
 #include <godot_cpp/classes/array_mesh.hpp>
@@ -20,6 +22,9 @@
 #include <godot_cpp/classes/shader_material.hpp>
 #include <godot_cpp/classes/quad_mesh.hpp>
 #include <godot_cpp/classes/plane_mesh.hpp>
+#include <godot_cpp/classes/box_mesh.hpp>
+#include <godot_cpp/classes/mesh_instance3d.hpp>
+#include <godot_cpp/classes/standard_material3d.hpp>
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/core/memory.hpp>
 #include <godot_cpp/classes/time.hpp>
@@ -33,6 +38,15 @@
 #include <algorithm>
 
 using namespace godot;
+
+// SDF sentinel: cells that have never been baked hold exactly this value.
+// MUST match the SDF_UNSET check in velocity_spread.glsl.
+static constexpr float SDF_UNSET_VALUE = -100.0f;
+static uint32_t sdf_unset_bits() {
+    uint32_t bits;
+    std::memcpy(&bits, &SDF_UNSET_VALUE, sizeof(bits));
+    return bits;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Push-constant layout sent to every compute dispatch (std430 / 16-byte align)
@@ -183,6 +197,8 @@ void FluidParticleSystem::_bind_methods() {
     ClassDB::bind_method(D_METHOD("get_physics_shader_path"),      &FluidParticleSystem::get_physics_shader_path);
     ClassDB::bind_method(D_METHOD("set_sortkey_shader_path","v"), &FluidParticleSystem::set_sortkey_shader_path);
     ClassDB::bind_method(D_METHOD("get_sortkey_shader_path"),      &FluidParticleSystem::get_sortkey_shader_path);
+    ClassDB::bind_method(D_METHOD("set_migrate_shader_path","v"), &FluidParticleSystem::set_migrate_shader_path);
+    ClassDB::bind_method(D_METHOD("get_migrate_shader_path"),      &FluidParticleSystem::get_migrate_shader_path);
     ClassDB::bind_method(D_METHOD("set_render_material","v"),  &FluidParticleSystem::set_render_material);
     ClassDB::bind_method(D_METHOD("get_render_material"),       &FluidParticleSystem::get_render_material);
     ClassDB::bind_method(D_METHOD("set_smooth_radius","v"),        &FluidParticleSystem::set_smooth_radius);
@@ -224,6 +240,36 @@ void FluidParticleSystem::_bind_methods() {
                          &FluidParticleSystem::_on_terrain_block_unloaded,
                          DEFVAL(0), DEFVAL(0), DEFVAL(0));
 
+    // Phase 3 debug hook: manually push a block event (e.g. from a test
+    // script) since upstream godot_voxel VoxelLodTerrain may not emit block
+    // signals yet. Same code path as real signals.
+    ClassDB::bind_method(D_METHOD("debug_simulate_block_event", "position", "lod", "loaded"),
+                         &FluidParticleSystem::debug_simulate_block_event);
+    // P5
+    ClassDB::bind_method(D_METHOD("get_lod_stats"), &FluidParticleSystem::get_lod_stats);
+    ClassDB::bind_method(D_METHOD("set_debug_tint_by_lod", "v"), &FluidParticleSystem::set_debug_tint_by_lod);
+    ClassDB::bind_method(D_METHOD("get_debug_tint_by_lod"),      &FluidParticleSystem::get_debug_tint_by_lod);
+    // P7
+    ClassDB::bind_method(D_METHOD("restore_spilled_particles", "max_count"),
+                         &FluidParticleSystem::restore_spilled_particles, DEFVAL(4096));
+    ClassDB::bind_method(D_METHOD("set_spill_to_disk", "v"), &FluidParticleSystem::set_spill_to_disk);
+    ClassDB::bind_method(D_METHOD("get_spill_to_disk"),      &FluidParticleSystem::get_spill_to_disk);
+    ClassDB::bind_method(D_METHOD("set_poll_terrain_blocks", "v"), &FluidParticleSystem::set_poll_terrain_blocks);
+    ClassDB::bind_method(D_METHOD("get_poll_terrain_blocks"),      &FluidParticleSystem::get_poll_terrain_blocks);
+    ClassDB::bind_method(D_METHOD("set_poll_interval_seconds", "v"), &FluidParticleSystem::set_poll_interval_seconds);
+    ClassDB::bind_method(D_METHOD("get_poll_interval_seconds"),      &FluidParticleSystem::get_poll_interval_seconds);
+    ClassDB::bind_method(D_METHOD("set_max_arena_pages", "v"), &FluidParticleSystem::set_max_arena_pages);
+    ClassDB::bind_method(D_METHOD("get_max_arena_pages"),      &FluidParticleSystem::get_max_arena_pages);
+    ClassDB::bind_method(D_METHOD("set_show_page_boxes", "v"), &FluidParticleSystem::set_show_page_boxes);
+    ClassDB::bind_method(D_METHOD("get_show_page_boxes"),      &FluidParticleSystem::get_show_page_boxes);
+    ClassDB::bind_method(D_METHOD("set_grid_window_follow", "v"), &FluidParticleSystem::set_grid_window_follow);
+    ClassDB::bind_method(D_METHOD("get_grid_window_follow"),      &FluidParticleSystem::get_grid_window_follow);
+    ClassDB::bind_method(D_METHOD("set_grid_window_margin", "v"), &FluidParticleSystem::set_grid_window_margin);
+    ClassDB::bind_method(D_METHOD("get_grid_window_margin"),      &FluidParticleSystem::get_grid_window_margin);
+    // P6
+    ClassDB::bind_method(D_METHOD("set_segment_dispatch", "v"), &FluidParticleSystem::set_segment_dispatch);
+    ClassDB::bind_method(D_METHOD("get_segment_dispatch"),      &FluidParticleSystem::get_segment_dispatch);
+
     // ── Inspector layout ───────────────────────────────────────────────────
     // Reload button at the top for quick iteration.
     ADD_GROUP("Shaders", "");
@@ -247,6 +293,30 @@ void FluidParticleSystem::_bind_methods() {
         PROPERTY_HINT_FILE, "*.glsl"), "set_physics_shader_path", "get_physics_shader_path");
     ADD_PROPERTY(PropertyInfo(Variant::STRING, "sortkey_shader_path",
         PROPERTY_HINT_FILE, "*.glsl"), "set_sortkey_shader_path", "get_sortkey_shader_path");
+    ADD_PROPERTY(PropertyInfo(Variant::STRING, "migrate_shader_path",
+        PROPERTY_HINT_FILE, "*.glsl"), "set_migrate_shader_path", "get_migrate_shader_path");
+    ADD_PROPERTY(PropertyInfo(Variant::BOOL, "debug_tint_by_lod"),
+        "set_debug_tint_by_lod", "get_debug_tint_by_lod");
+    ADD_PROPERTY(PropertyInfo(Variant::BOOL, "spill_to_disk"),
+        "set_spill_to_disk", "get_spill_to_disk");
+    ADD_PROPERTY(PropertyInfo(Variant::BOOL, "segment_dispatch"),
+        "set_segment_dispatch", "get_segment_dispatch");
+    ADD_PROPERTY(PropertyInfo(Variant::BOOL, "poll_terrain_blocks"),
+        "set_poll_terrain_blocks", "get_poll_terrain_blocks");
+    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "poll_interval_seconds",
+        PROPERTY_HINT_RANGE, "0.05,5.0,0.05"),
+        "set_poll_interval_seconds", "get_poll_interval_seconds");
+    ADD_PROPERTY(PropertyInfo(Variant::INT, "max_arena_pages",
+        PROPERTY_HINT_RANGE, "64,65536,64"),
+        "set_max_arena_pages", "get_max_arena_pages");
+    ADD_PROPERTY(PropertyInfo(Variant::BOOL, "show_page_boxes"),
+        "set_show_page_boxes", "get_show_page_boxes");
+    ADD_GROUP("Infinite World", "grid_window_");
+    ADD_PROPERTY(PropertyInfo(Variant::BOOL, "grid_window_follow"),
+        "set_grid_window_follow", "get_grid_window_follow");
+    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "grid_window_margin",
+        PROPERTY_HINT_RANGE, "0.05,0.45,0.01"),
+        "set_grid_window_margin", "get_grid_window_margin");
     // Composite material — when set, pre-fills with fluid_composite.gdshader
     // so the user can edit the composite shader code + uniforms in the inspector.
     ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "composite_material",
@@ -359,15 +429,23 @@ void FluidParticleSystem::set_sortkey_shader_path(const String &v) {
     sortkey_shader_path = v;
     if (is_inside_tree()) _reload_compute_shader(2);
 }
+void FluidParticleSystem::set_migrate_shader_path(const String &v) {
+    if (migrate_shader_path == v) return;
+    migrate_shader_path = v;
+    if (is_inside_tree()) _reload_compute_shader(3);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
-void FluidParticleSystem::set_grid_width(int v)   { if (grid_width  == v) return; grid_width  = v; _rebuild_gpu_resources(); }
-void FluidParticleSystem::set_grid_height(int v)  { if (grid_height == v) return; grid_height = v; _rebuild_gpu_resources(); }
-void FluidParticleSystem::set_grid_depth(int v)   { if (grid_depth  == v) return; grid_depth  = v; _rebuild_gpu_resources(); }
+// Grid size only affects the LOD page table (page count per LOD is derived
+// from grid dims). Particle buffers, pipelines, and render pipeline are
+// unaffected — only rebuild LOD resources + the uniform sets that bind them.
+void FluidParticleSystem::set_grid_width(int v)   { if (grid_width  == v) return; grid_width  = v; if (is_inside_tree() && gpu_ready) { _destroy_lod_resources(); _build_lod_resources(); _rebuild_compute_uniform_sets(); } }
+void FluidParticleSystem::set_grid_height(int v)  { if (grid_height == v) return; grid_height = v; if (is_inside_tree() && gpu_ready) { _destroy_lod_resources(); _build_lod_resources(); _rebuild_compute_uniform_sets(); } }
+void FluidParticleSystem::set_grid_depth(int v)   { if (grid_depth  == v) return; grid_depth  = v; if (is_inside_tree() && gpu_ready) { _destroy_lod_resources(); _build_lod_resources(); _rebuild_compute_uniform_sets(); } }
 void FluidParticleSystem::set_grid_size(Vector3i v) {
     if (grid_width == v.x && grid_height == v.y && grid_depth == v.z) return;
     grid_width = v.x; grid_height = v.y; grid_depth = v.z;
-    _rebuild_gpu_resources();
+    if (is_inside_tree() && gpu_ready) { _destroy_lod_resources(); _build_lod_resources(); _rebuild_compute_uniform_sets(); }
 }
 void FluidParticleSystem::set_num_particles(int v) {
     if (num_particles == v) return;
@@ -709,7 +787,7 @@ bool FluidParticleSystem::_create_vertex_array() {
     }
 
     TypedArray<RID> src_buffers;
-    src_buffers.append(vertex_buf);
+    src_buffers.append(render_vertex_buf);  // render reads interpolated positions
     src_buffers.append(attrib_buf);
     rd_vertex_array = rd->vertex_array_create(num_particles, rd_vertex_format, src_buffers);
     if (!rd_vertex_array.is_valid()) {
@@ -1017,6 +1095,116 @@ void FluidParticleSystem::_destroy_composite_node() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Debug page-box overlay: one transparent AABB child per loaded page, tinted
+// by LOD with the same palette as the particle debug tint:
+//   L0 blue, L1 green, L2 orange, L3 red, L4+ magenta.
+// Meshes are pooled and reused; the overlay rebuilds only when the allocated
+// page count changes (polled block loads trigger that), not every frame.
+// ─────────────────────────────────────────────────────────────────────────────
+void FluidParticleSystem::_update_page_debug_overlay() {
+    if (!show_page_boxes || !is_inside_tree()) return;
+
+    // Count allocated pages + collect their coords/LODs.
+    struct PageBox { int lod; Vector3i pos; };
+    std::vector<PageBox> boxes;
+    for (int lod = 0; lod < lod_levels; ++lod) {
+        const int64_t base = _lod_table_base(lod);
+        if (base < 0) continue;
+        const Vector3i d = _lod_table_dims(lod);
+        for (int z = 0; z < d.z; ++z)
+        for (int y = 0; y < d.y; ++y)
+        for (int x = 0; x < d.x; ++x) {
+            const int64_t tidx = _lod_table_index(lod, Vector3i(x, y, z));
+            if (tidx < 0) continue;
+            if ((lod_table_cpu[(size_t)tidx].flags & LOD_PAGE_FLAG_ALLOCATED) != 0) {
+                boxes.push_back({ lod, Vector3i(x, y, z) });
+            }
+        }
+    }
+    if ((int)boxes.size() == last_overlay_page_count) return;   // no change
+    last_overlay_page_count = (int)boxes.size();
+
+    // Create the container node on first use.
+    if (!page_overlay_node || !page_overlay_node->is_inside_tree()) {
+        page_overlay_node = memnew(Node3D);
+        page_overlay_node->set_name("LodPageDebugBoxes");
+        add_child(page_overlay_node);
+    }
+
+    // Per-LOD palette (matches lod_tint in velocity_spread.glsl) + one shared
+    // material per LOD. Overlap control: boxes from different LODs overlap by
+    // definition (each L0 cell sits inside an allocated L1/L2 shell page), so
+    // stacked translucent fills double-darken. L0 carries the fill; coarse
+    // LOD pages get a near-zero fill and a boosted alpha so they read as
+    // colored frames around the fine grid instead of fog over it.
+    static const Color lod_colors[5] = {
+        Color(0.45f, 0.70f, 1.00f), Color(0.30f, 1.00f, 0.35f),
+        Color(1.00f, 0.75f, 0.25f), Color(1.00f, 0.30f, 0.25f),
+        Color(1.00f, 0.35f, 1.00f),
+    };
+    if ((int)page_lod_materials.size() != lod_levels) {
+        page_lod_materials.clear();
+        for (int lod = 0; lod < lod_levels; ++lod) {
+            Ref<StandardMaterial3D> mat;
+            mat.instantiate();
+            mat->set_transparency(StandardMaterial3D::TRANSPARENCY_ALPHA);
+            mat->set_shading_mode(StandardMaterial3D::SHADING_MODE_UNSHADED);
+            mat->set_cull_mode(StandardMaterial3D::CULL_DISABLED);
+            mat->set_flag(StandardMaterial3D::FLAG_DISABLE_DEPTH_TEST, false);
+            const Color c = lod < 5 ? lod_colors[lod] : lod_colors[4];
+            mat->set_albedo(Color(c.r, c.g, c.b, lod == 0 ? 0.07f : 0.02f));
+            page_lod_materials.push_back(mat);
+        }
+    }
+
+    // Grow the mesh pool if needed. Each pooled entry: MeshInstance3D with a
+    // unit BoxMesh that uses the per-LOD shared material, swapped per use.
+    while ((int)page_box_pool.size() < (int)boxes.size()) {
+        MeshInstance3D *mi = memnew(MeshInstance3D);
+        Ref<BoxMesh> bm;
+        bm.instantiate();
+        bm->set_size(Vector3(1, 1, 1));   // scaled per-instance below
+        bm->set_material(page_lod_materials[0]);
+        mi->set_mesh(bm);
+        mi->set_cast_shadows_setting(GeometryInstance3D::SHADOW_CASTING_SETTING_OFF);
+        page_overlay_node->add_child(mi);
+        page_box_pool.push_back(mi);
+    }
+    // Hide unused pooled entries.
+    for (size_t i = boxes.size(); i < page_box_pool.size(); ++i) {
+        page_box_pool[i]->hide();
+    }
+
+    for (size_t i = 0; i < boxes.size(); ++i) {
+        const PageBox &pb = boxes[i];
+        MeshInstance3D *mi = page_box_pool[i];
+        const int page_voxels = LOD_PAGE_SIZE << pb.lod;
+        // Per-LOD inset keeps different-LOD shells from coplanar-overlapping:
+        // coarse boxes are pulled in slightly more, so their surfaces sit
+        // clearly outside/below the fine grid rather than coinciding with it.
+        const float pad = 0.97f - 0.01f * (float)pb.lod;
+        // BoxMesh is centered on the node origin, so put the node at the page
+        // CENTER, not its corner — otherwise every box is offset by half a
+        // page and coarse LODs look diagonally shifted vs the fine grid.
+        const float pv = (float)page_voxels;
+        mi->set_position(Vector3(Vector3(pb.pos) * pv + Vector3(pv * 0.5f, pv * 0.5f, pv * 0.5f)));
+        mi->set_scale(Vector3(pv, pv, pv) * pad);
+        Ref<BoxMesh> bm = mi->get_mesh();
+        if (bm.is_valid()) bm->set_material(page_lod_materials[pb.lod]);
+        mi->show();
+    }
+}
+
+void FluidParticleSystem::_destroy_page_debug_overlay() {
+    if (page_overlay_node) {
+        page_overlay_node->queue_free();
+        page_overlay_node = nullptr;
+    }
+    page_box_pool.clear();
+    last_overlay_page_count = -1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Resize the RD color+depth textures + framebuffer to match the main viewport.
 // Called every frame from _sync_offscreen_camera().
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1217,6 +1405,49 @@ Camera3D *FluidParticleSystem::_resolve_main_camera() {
     return found;
 }
 
+// Resolve the world-space position the SIM WINDOW should follow.
+//
+// Preference order:
+//   1. A VoxelViewer node (godot_voxel) — this is what actually drives the
+//      terrain's block streaming, so anchoring the window to it guarantees the
+//      sim box sits exactly where terrain pages are loading. Nearest viewer
+//      to the camera wins if there are several.
+//   2. The main camera (previous behavior) — fallback when no VoxelViewer
+//      exists in the scene.
+Node3D *FluidParticleSystem::_resolve_follow_anchor() {
+    // Cached anchor still valid? (Avoids a full-scene scan every frame.)
+    if (follow_anchor_id.is_valid()) {
+        if (Node3D *cached = Object::cast_to<Node3D>(ObjectDB::get_instance(follow_anchor_id))) {
+            if (cached->is_class("VoxelViewer") && cached->is_inside_tree()) return cached;
+        }
+        follow_anchor_id = ObjectID();   // stale
+    }
+
+    // Search the whole scene for VoxelViewer instances. Class is provided by
+    // the separate godot_voxel GDExtension, so match by class name.
+    Node *root = get_tree() ? get_tree()->get_root() : nullptr;
+    if (root) {
+        Node3D *best = nullptr;
+        float best_d = 1e30f;
+        const Vector3 cam_pos = _resolve_main_camera()
+            ? _resolve_main_camera()->get_global_position() : get_global_position();
+        std::vector<Node *> stack{ root };
+        while (!stack.empty()) {
+            Node *n = stack.back(); stack.pop_back();
+            for (int i = 0; i < n->get_child_count(); ++i) stack.push_back(n->get_child(i));
+            Node3D *n3 = Object::cast_to<Node3D>(n);
+            if (!n3 || !n3->is_class("VoxelViewer")) continue;
+            const float d = n3->get_global_position().distance_squared_to(cam_pos);
+            if (d < best_d) { best_d = d; best = n3; }
+        }
+        if (best) {
+            follow_anchor_id = best->get_instance_id();
+            return best;
+        }
+    }
+    return _resolve_main_camera();
+}
+
 // The material actually drawn by composite_node: the user's override if set,
 // else the internal composite material. Per-frame uniforms go here.
 Ref<ShaderMaterial> FluidParticleSystem::_active_composite_material() const {
@@ -1279,25 +1510,18 @@ void FluidParticleSystem::_sync_offscreen_camera() {
 // ─────────────────────────────────────────────────────────────────────────────
 void FluidParticleSystem::_enter_tree() {
     if (!_ensure_device()) return;
-    _build_gpu_resources();
-    _ensure_rd_render_pipeline();
 
-    // Instantiate a VoxelLodTerrain child (forced to a single LOD for P1)
-    // sized to the fluid grid and extract its SDF into the chunk buffer.
+    // Create / adopt the VoxelLodTerrain child BEFORE building GPU resources,
+    // so the poller can query the terrain for SDF data.
     _refresh_sdf_from_child();
 
-    // Bake the SDF (now in sdf_storage_buf) into the chunk grid's sdf_bits
-    // field via clear_grid. Without this the chunk buffer stays zero-filled
-    // and the physics shader's collision check (sdf < 0) never fires.
-    _sync_rd();
-    _dispatch_clear_grid();
-    rd->submit();
-    rd->sync();
-    rd_submitted = false;
+    _build_gpu_resources();
+    _ensure_rd_render_pipeline();
 }
 
 void FluidParticleSystem::_exit_tree() {
     _destroy_composite_node();
+    _destroy_page_debug_overlay();
     _shutdown_gpu();
 }
 
@@ -1373,6 +1597,12 @@ void FluidParticleSystem::_build_gpu_resources() {
             vp[i * 3 + 2] = 0.0f;
         }
 
+        // Render vertex buffer: interpolated display positions. Same layout
+        // as vertex_buf. The physics shader lerps this toward vertex_buf every
+        // frame (skip path) so LOD-k particles render smoothly between their
+        // 2^k-spaced full physics steps. Render reads from this buffer.
+        // Created below alongside vertex_buf (needs buf_flags).
+
         // Attribute buffer: vec4 color + vec4 custom0 per particle.
         uint32_t abuf_size = num_particles * 8 * sizeof(float);
         PackedByteArray abuf_data;
@@ -1421,7 +1651,8 @@ void FluidParticleSystem::_build_gpu_resources() {
             RenderingDevice::BUFFER_CREATION_AS_STORAGE_BIT;
         vertex_buf = rd->vertex_buffer_create(vbuf_size, vbuf_data, buf_flags);
         attrib_buf = rd->vertex_buffer_create(abuf_size, abuf_data, buf_flags);
-        if (!vertex_buf.is_valid() || !attrib_buf.is_valid()) {
+        render_vertex_buf = rd->vertex_buffer_create(vbuf_size, vbuf_data, buf_flags);
+        if (!vertex_buf.is_valid() || !attrib_buf.is_valid() || !render_vertex_buf.is_valid()) {
             UtilityFunctions::printerr("FluidParticleSystem: failed to create particle buffers.");
             _destroy_gpu_resources();
             return;
@@ -1434,15 +1665,21 @@ void FluidParticleSystem::_build_gpu_resources() {
         custom0_offset_words = 4;           // custom0 at offset 4 words (16 bytes)
     }
 
-    // ── Chunk grid buffer ────────────────────────────────────────────────────
+    // ── Chunk grid buffer (legacy, minimal) ──────────────────────────────────
+    // The LOD-aware physics shader reads/writes the ARENA (binding 6), not
+    // this buffer. clear_grid still writes sdf_bits here but physics reads SDF
+    // from sdf_storage_buf (binding 5), so those writes are dead. source/sink
+    // writes occupant here but physics reads occupant from the arena. This
+    // buffer exists ONLY for uniform-set layout compatibility (binding 2 must
+    // be bound in every set the shader declares). A single page is enough —
+    // the old full grid³×32B allocation was 512 MB of dead VRAM.
     {
-        int64_t cell_count = (int64_t)grid_width * grid_height * grid_depth;
-        int64_t buf_size   = cell_count * sizeof(GPUChunkCell);
+        int64_t buf_size = (int64_t)LOD_PAGE_CELLS * sizeof(GPUChunkCell);
         PackedByteArray data;
         data.resize(buf_size);
         data.fill(0);
         GPUChunkCell *cells = reinterpret_cast<GPUChunkCell*>(data.ptrw());
-        for (int64_t i = 0; i < cell_count; i++) {
+        for (int64_t i = 0; i < LOD_PAGE_CELLS; i++) {
             cells[i].occupant = -1;
         }
         chunk_buf = rd->storage_buffer_create(buf_size, data);
@@ -1473,33 +1710,19 @@ void FluidParticleSystem::_build_gpu_resources() {
         return;
     }
 
-    // ── SDF storage buffer ──────────────────────────────────────────────────
-    // Allocated once at the full grid size (grid_w * grid_h * grid_d floats)
-    // and never reallocated. clear_grid.glsl reads it directly at binding 5.
-    // When no SDF is loaded the contents are zero (sdf==0 → treated as surface
-    // by the shader, harmless) and has_sdf=0 in the push constant skips the
-    // collision path. _upload_sdf_data just buffer_update's into this buffer.
-    {
-        int64_t sdf_floats = (int64_t)grid_width * grid_height * grid_depth;
-        PackedByteArray zeros;
-        zeros.resize(sdf_floats * sizeof(float));
-        zeros.fill(0);
-        sdf_storage_buf = rd->storage_buffer_create(sdf_floats * sizeof(float), zeros);
-        // Track the dimensions the shader expects (1:1 with the fluid grid).
-        sdf_w = grid_width;
-        sdf_h = grid_height;
-        sdf_d = grid_depth;
-    }
-
-    // Upload SDF data if a VoxelBuffer was assigned before the GPU was ready.
-    if (sdf_buffer_var.get_type() != Variant::NIL) {
-        _upload_sdf_data();
-    }
+    // ── LOD arena + page table + store ring (P2) ─────────────────────────
+    // Standalone in P2: the shaders still see chunk_buf through the existing
+    // uniform sets. These get their own bindings in P3 when lod_arena.glsl and
+    // the physics LOD path land.
+    _build_lod_resources();
 
     // ── Load and compile compute shaders ─────────────────────────────────────
     clear_shader   = _compile_compute_shader(clear_shader_path);
     physics_shader = _compile_compute_shader(physics_shader_path);
     sortkey_shader = _compile_compute_shader(sortkey_shader_path);
+    migrate_shader = _compile_compute_shader(migrate_shader_path);
+
+    if (migrate_shader.is_valid()) migrate_pipeline = rd->compute_pipeline_create(migrate_shader);
 
     if (clear_shader.is_valid())   clear_pipeline   = rd->compute_pipeline_create(clear_shader);
     if (physics_shader.is_valid()) physics_pipeline = rd->compute_pipeline_create(physics_shader);
@@ -1519,11 +1742,16 @@ void FluidParticleSystem::_build_gpu_resources() {
 // All three compute pipelines share the same buffer bindings:
 //   binding 0 -> vertex buffer (position)
 //   binding 1 -> attribute buffer (color + custom0)
-//   binding 2 -> chunk_grid
+//   binding 2 -> chunk_grid (legacy; physics no longer reads it but keeps the
+//               uniform set layout compatible with clear/sortkey)
 //   binding 3 -> runnable_indices
 //   binding 4 -> sort_keys
 // clear_grid additionally binds:
 //   binding 5 -> SDF data (float[], ZXY order) or a dummy buffer
+// physics (P4) additionally binds:
+//   binding 6 -> cell arena (paged ChunkCells)
+//   binding 7 -> LOD page table (16-byte entries)
+//   binding 8 -> store ring (u32: cursor, overflow, particle indices)
 void FluidParticleSystem::_rebuild_compute_uniform_sets() {
     if (!rd) return;
 
@@ -1534,14 +1762,6 @@ void FluidParticleSystem::_rebuild_compute_uniform_sets() {
     uniforms.append(_make_storage_uniform(runnable_buf, 3));
     uniforms.append(_make_storage_uniform(sort_key_buf, 4));
 
-    if (physics_shader.is_valid() && !physics_uniform_set.is_valid())
-        physics_uniform_set = rd->uniform_set_create(uniforms, physics_shader, 0);
-    if (sortkey_shader.is_valid() && !sortkey_uniform_set.is_valid())
-        sortkey_uniform_set = rd->uniform_set_create(uniforms, sortkey_shader, 0);
-
-    // clear_grid gets its own uniform set with the extra SDF binding.
-    // sdf_storage_buf is always valid (allocated at grid size in
-    // _build_gpu_resources), so there's no dummy fallback.
     if (clear_shader.is_valid() && !clear_uniform_set.is_valid()) {
         TypedArray<RDUniform> clear_uniforms;
         clear_uniforms.append(_make_storage_uniform(vertex_buf,   0));
@@ -1549,8 +1769,43 @@ void FluidParticleSystem::_rebuild_compute_uniform_sets() {
         clear_uniforms.append(_make_storage_uniform(chunk_buf,    2));
         clear_uniforms.append(_make_storage_uniform(runnable_buf, 3));
         clear_uniforms.append(_make_storage_uniform(sort_key_buf, 4));
-        clear_uniforms.append(_make_storage_uniform(sdf_storage_buf, 5));
+        // binding 5: dummy buffer (SDF is now baked into arena cells, but
+        // clear_grid.glsl still declares the binding for layout compat).
+        clear_uniforms.append(_make_storage_uniform(chunk_buf, 5));
         clear_uniform_set = rd->uniform_set_create(clear_uniforms, clear_shader, 0);
+    }
+
+    // Physics (Phase 4): bindings 0-4 as before, PLUS 6 = cell arena,
+    // 7 = LOD page table, 8 = store ring. The dense chunk_buf (binding 2)
+    // is still bound for uniform-set layout compatibility but the LOD-aware
+    // physics shader no longer reads it. SDF is now read from arena cells
+    // (acells[cidx].sdf_bits), not a separate SDF buffer.
+    if (physics_shader.is_valid() && !physics_uniform_set.is_valid()) {
+        TypedArray<RDUniform> phys_uniforms;
+        phys_uniforms.append(_make_storage_uniform(vertex_buf,   0));
+        phys_uniforms.append(_make_storage_uniform(attrib_buf,   1));
+        phys_uniforms.append(_make_storage_uniform(chunk_buf,    2));
+        phys_uniforms.append(_make_storage_uniform(runnable_buf, 3));
+        phys_uniforms.append(_make_storage_uniform(sort_key_buf, 4));
+        // binding 10: render vertex buffer (interpolated display positions)
+        phys_uniforms.append(_make_storage_uniform(render_vertex_buf, 10));
+        phys_uniforms.append(_make_storage_uniform(cell_arena_buf, 6));
+        phys_uniforms.append(_make_storage_uniform(lod_table_buf,  7));
+        phys_uniforms.append(_make_storage_uniform(store_ring_buf, 8));
+        // P5: per-LOD particle-count scratch (zeroed pre-dispatch each frame).
+        phys_uniforms.append(_make_storage_uniform(lod_stats_buf, 9));
+        physics_uniform_set = rd->uniform_set_create(phys_uniforms, physics_shader, 0);
+    }
+
+    if (sortkey_shader.is_valid() && !sortkey_uniform_set.is_valid())
+        sortkey_uniform_set = rd->uniform_set_create(uniforms, sortkey_shader, 0);
+
+    // lod_migrate binds only the arena (binding 0 = ArenaBuffer). Uses its own
+    // uniform set since its set-0 layout differs from the other pipelines.
+    if (migrate_shader.is_valid() && cell_arena_buf.is_valid() && !migrate_uniform_set.is_valid()) {
+        TypedArray<RDUniform> migrate_uniforms;
+        migrate_uniforms.append(_make_storage_uniform(cell_arena_buf, 0));
+        migrate_uniform_set = rd->uniform_set_create(migrate_uniforms, migrate_shader, 0);
     }
 }
 
@@ -1597,11 +1852,18 @@ void FluidParticleSystem::_destroy_render_resources(bool deferred_targets) {
 void FluidParticleSystem::_destroy_sim_resources() {
     if (!rd) {
         clear_uniform_set = RID();  physics_uniform_set = RID();  sortkey_uniform_set = RID();
+        migrate_uniform_set = RID();
         clear_pipeline    = RID();  physics_pipeline    = RID();  sortkey_pipeline    = RID();
+        migrate_pipeline  = RID();
         clear_shader      = RID();  physics_shader      = RID();  sortkey_shader      = RID();
+        migrate_shader    = RID();
         vertex_buf = RID(); attrib_buf = RID(); chunk_buf = RID();
+        render_vertex_buf = RID();
         runnable_buf = RID(); sort_key_buf = RID();
-        sdf_storage_buf = RID();
+        cell_arena_buf = RID(); lod_table_buf = RID();
+        store_ring_buf = RID(); lod_stats_buf = RID();
+        lod_buffers_valid = false;
+        lod_arena = VoxelLodArena();
         return;
     }
 
@@ -1610,22 +1872,621 @@ void FluidParticleSystem::_destroy_sim_resources() {
     _free_local_rid(clear_uniform_set);
     _free_local_rid(physics_uniform_set);
     _free_local_rid(sortkey_uniform_set);
+    _free_local_rid(migrate_uniform_set);
 
     _free_local_rid(clear_pipeline);
     _free_local_rid(physics_pipeline);
     _free_local_rid(sortkey_pipeline);
+    _free_local_rid(migrate_pipeline);
 
     _free_local_rid(clear_shader);
     _free_local_rid(physics_shader);
     _free_local_rid(sortkey_shader);
+    _free_local_rid(migrate_shader);
 
     _free_local_rid(vertex_buf);
     _free_local_rid(attrib_buf);
     _free_local_rid(chunk_buf);
+    _free_local_rid(render_vertex_buf);
     _free_local_rid(runnable_buf);
     _free_local_rid(sort_key_buf);
-    _free_local_rid(sdf_storage_buf);
+
+    _destroy_lod_resources();
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LOD arena resources (P2).
+//
+//   cell_arena_buf : max_arena_pages pages × 4096 ChunkCells (32 B each). All
+//                    cells start zeroed with occupant = -1 (matches the dense
+//                    chunk grid's initial state).
+//   lod_table_buf  : one 16 B LodPageEntry per (lod, page coord), laid out as
+//                    lod-major blocks. CPU mirror in lod_table_cpu; individual
+//                    entries are pushed with 16-byte buffer_update on each
+//                    lifecycle event (cheap, signal-driven).
+//   store_ring_buf : u32[65536+2] = data N + header {write_cursor, overflow}.
+//   lod_stats_buf  : int32[32] scratch for P4 stats.
+//
+// Owns the geometry helpers too — page-table dims are derived from the sim box
+// so a grid resize rebuilds the table consistently via _destroy/_build.
+// ─────────────────────────────────────────────────────────────────────────────
+void FluidParticleSystem::_build_lod_resources() {
+    if (!rd) {
+        return;
+    }
+    _destroy_lod_resources();
+
+    // ── Page-table geometry: per-LOD dims over the sim box ──────────────────
+    lod_table_cpu.clear();
+    lod_table_base.clear();
+    lod_table_base.reserve(lod_levels + 1);
+    int64_t total_entries = 0;
+    for (int lod = 0; lod < lod_levels; ++lod) {
+        lod_table_base.push_back((int32_t)total_entries);
+        Vector3i dims = _lod_table_dims(lod);
+        total_entries += (int64_t)dims.x * dims.y * dims.z;
+    }
+    lod_table_base.push_back((int32_t)total_entries);  // end sentinel
+    lod_table_cpu.assign((size_t)total_entries, LodPageEntry{ 0, 0, -1, 0 });
+
+    // ── Arena: cell slots, occupant initialized to -1 ────────────────────────
+    {
+        const int64_t cell_count = (int64_t)max_arena_pages * LOD_PAGE_CELLS;
+        PackedByteArray data;
+        data.resize(cell_count * sizeof(GPUChunkCell));
+        data.fill(0);
+        GPUChunkCell *cells = reinterpret_cast<GPUChunkCell *>(data.ptrw());
+        const uint32_t unset_bits = sdf_unset_bits();
+        for (int64_t i = 0; i < cell_count; ++i) {
+            cells[i].occupant = -1;
+            cells[i].sdf_bits = unset_bits;
+        }
+        cell_arena_buf = rd->storage_buffer_create(cell_count * (int64_t)sizeof(GPUChunkCell), data);
+        if (!cell_arena_buf.is_valid()) {
+            UtilityFunctions::printerr("FluidParticleSystem: failed to create LOD cell arena buffer.");
+            _destroy_lod_resources();
+            return;
+        }
+    }
+
+    // ── Page table ──────────────────────────────────────────────────────────
+    {
+        PackedByteArray data;
+        data.resize((int64_t)lod_table_cpu.size() * sizeof(LodPageEntry));
+        data.fill(0);
+        // occupant_hint = -1 everywhere (nothing resident yet).
+        int32_t *words = reinterpret_cast<int32_t *>(data.ptrw());
+        for (size_t i = 0; i < lod_table_cpu.size(); ++i) {
+            words[i * 4 + 2] = -1;
+        }
+        lod_table_buf = rd->storage_buffer_create((int64_t)lod_table_cpu.size() * (int64_t)sizeof(LodPageEntry), data);
+        if (!lod_table_buf.is_valid()) {
+            UtilityFunctions::printerr("FluidParticleSystem: failed to create LOD page table buffer.");
+            _destroy_lod_resources();
+            return;
+        }
+    }
+
+    // ── Store ring: 2-word header + N indices ────────────────────────────────
+    {
+        PackedByteArray data;
+        data.resize((65536 + 2) * sizeof(uint32_t));
+        data.fill(0);
+        store_ring_buf = rd->storage_buffer_create((65536 + 2) * (int64_t)sizeof(uint32_t), data);
+        if (!store_ring_buf.is_valid()) {
+            UtilityFunctions::printerr("FluidParticleSystem: failed to create store-ring buffer.");
+            _destroy_lod_resources();
+            return;
+        }
+    }
+
+    // ── Stats scratch ───────────────────────────────────────────────────────
+    {
+        PackedByteArray zeros;
+        zeros.resize(32 * sizeof(int32_t));
+        zeros.fill(0);
+        lod_stats_buf = rd->storage_buffer_create(32 * (int64_t)sizeof(int32_t), zeros);
+        if (!lod_stats_buf.is_valid()) {
+            UtilityFunctions::printerr("FluidParticleSystem: failed to create LOD stats buffer.");
+            _destroy_lod_resources();
+            return;
+        }
+    }
+
+    lod_arena.configure(max_arena_pages);
+    sdf_baked_pages.clear();
+    lod_buffers_valid = true;
+
+    UtilityFunctions::print("FluidParticleSystem: LOD arena ready — ",
+                            max_arena_pages, " pages (", (int64_t)max_arena_pages * LOD_PAGE_CELLS,
+                            " cells), table entries ", (int64_t)lod_table_cpu.size(),
+                            ", lod_levels ", lod_levels);
+}
+
+void FluidParticleSystem::_destroy_lod_resources() {
+    if (rd) {
+        // Uniform sets reference cell_arena_buf / lod_table_buf / etc. —
+        // invalidate them so _rebuild_compute_uniform_sets recreates with
+        // the new buffer RIDs.
+        _free_local_rid(physics_uniform_set);
+        _free_local_rid(migrate_uniform_set);
+        _free_local_rid(cell_arena_buf);
+        _free_local_rid(lod_table_buf);
+        _free_local_rid(store_ring_buf);
+        _free_local_rid(lod_stats_buf);
+    }
+    cell_arena_buf = RID(); lod_table_buf = RID();
+    store_ring_buf = RID(); lod_stats_buf = RID();
+    lod_table_cpu.clear();
+    lod_table_base.clear();
+    lod_arena = VoxelLodArena();
+    sdf_baked_pages.clear();
+    lod_buffers_valid = false;
+}
+
+Vector3i FluidParticleSystem::_lod_table_dims(int lod) const {
+    // One page covers (16 << lod) voxel units per axis.
+    const int page_voxels = LOD_PAGE_SIZE << lod;
+    return Vector3i(
+        (grid_width  + page_voxels - 1) / page_voxels,
+        (grid_height + page_voxels - 1) / page_voxels,
+        (grid_depth  + page_voxels - 1) / page_voxels);
+}
+
+int64_t FluidParticleSystem::_lod_table_base(int lod) const {
+    if (lod < 0 || lod >= (int)lod_table_base.size() - 1) {
+        return -1;
+    }
+    return lod_table_base[lod];
+}
+
+int64_t FluidParticleSystem::_lod_table_index(int lod, Vector3i page_pos) const {
+    const int64_t base = _lod_table_base(lod);
+    if (base < 0) {
+        return -1;
+    }
+    const Vector3i d = _lod_table_dims(lod);
+    if (page_pos.x < 0 || page_pos.y < 0 || page_pos.z < 0 ||
+        page_pos.x >= d.x || page_pos.y >= d.y || page_pos.z >= d.z) {
+        return -1;
+    }
+    return base + (int64_t)page_pos.x + d.x * ((int64_t)page_pos.y + d.y * (int64_t)page_pos.z);
+}
+
+void FluidParticleSystem::_lod_table_upload(int64_t index) {
+    if (!rd || !lod_table_buf.is_valid() ||
+        index < 0 || index >= (int64_t)lod_table_cpu.size()) {
+        return;
+    }
+    const LodPageEntry &e = lod_table_cpu[(size_t)index];
+    PackedByteArray data;
+    data.resize(sizeof(LodPageEntry));
+    memcpy(data.ptrw(), &e, sizeof(LodPageEntry));
+    rd->buffer_update(lod_table_buf, (uint32_t)(index * (int64_t)sizeof(LodPageEntry)),
+                      sizeof(LodPageEntry), data);
+}
+
+void FluidParticleSystem::_bake_sdf_for_page(int lod, Vector3i page_pos, uint32_t cell_base) {
+    // Query the terrain for SDF data at this page's LOD and write sdf_bits
+    // into each of the 4096 arena cells. Zero-fills occupant/vel/count —
+    // this only runs once per page (guarded by sdf_baked_pages) and almost
+    // always the same frame the page was allocated, before any particle can
+    // have joined it.
+    Object *terrain = _get_voxel_terrain_child();
+    if (!terrain || !rd || !cell_arena_buf.is_valid()) return;
+
+    const int page_voxels = LOD_PAGE_SIZE << lod;
+    // World-space origin of this page.
+    const Vector3i world_origin = grid_window_origin + page_pos * page_voxels;
+
+    // Create a VoxelBuffer sized to one page and copy SDF from the terrain.
+    Variant vb_var = ClassDB::instantiate("VoxelBuffer");
+    Object *vb = Object::cast_to<Object>(vb_var);
+    if (!vb) return;
+    vb->call("create", page_voxels, page_voxels, page_voxels);
+    vb->call("set_channel_depth", 1, 2);  // CHANNEL_SDF=1, DEPTH_32_BIT=2
+
+    Variant vt_var = terrain->call("get_voxel_tool");
+    Object *vt = Object::cast_to<Object>(vt_var);
+    if (!vt) return;
+    Variant copy_ret = vt->call("copy", world_origin, vb_var, 2, false);
+    int copy_err = (int)copy_ret;
+    if (copy_err != 0) {
+        UtilityFunctions::printerr("FluidParticleSystem: SDF copy failed for page lod=",
+                                   lod, " pos=", page_pos, " err=", copy_err);
+        return;
+    }
+
+    // Get the raw SDF channel data.
+    PackedByteArray raw = vb->call("get_channel_as_byte_array", 1);
+    if (raw.size() == 0) return;
+
+    int64_t depth_val = vb->call("get_channel_depth", 1);
+    int depth = (int)depth_val;
+
+    // Decode a single SDF value at VoxelBuffer-local (x,y,z). godot_voxel
+    // stores channel data in ZXY order — index = y + size.y*(x + size.x*z) —
+    // NOT plain XYZ. Getting this wrong reads real, plausible-looking SDF
+    // floats from the WRONG voxel position (scrambled axes), which looks
+    // like "data is written but nothing sees the terrain correctly".
+    // Scale constants (10.0 for 8-bit, 500.0 for 16-bit) match godot_voxel's
+    // QUANTIZED_SDF_8/16_BITS_SCALE_INV exactly (constants/voxel_constants.h).
+    const int pv = page_voxels;
+    auto decode_sdf = [&](int x, int y, int z) -> float {
+        int64_t idx = (int64_t)y + (int64_t)pv * ((int64_t)x + (int64_t)pv * (int64_t)z);
+        if (depth == 0) {
+            const int8_t *s8 = reinterpret_cast<const int8_t *>(raw.ptr());
+            return std::max((float)s8[idx] / 127.0f, -1.0f) * 10.0f;
+        } else if (depth == 1) {
+            const int16_t *s16 = reinterpret_cast<const int16_t *>(raw.ptr());
+            return std::max((float)s16[idx] / 32767.0f, -1.0f) * 500.0f;
+        } else if (depth == 2) {
+            const float *f32 = reinterpret_cast<const float *>(raw.ptr());
+            return f32[idx];
+        } else if (depth == 3) {
+            const double *d = reinterpret_cast<const double *>(raw.ptr());
+            return (float)d[idx];
+        }
+        return 100.0f;
+    };
+
+    // The arena page is always 16³ cells. Each cell covers (page_voxels/16)
+    // voxels per axis. Sample the SDF at the center of each cell's voxel range
+    // so LOD > 0 gets a representative value, not the last voxel that maps
+    // to the cell.
+    const int voxels_per_cell = page_voxels / 16;  // 1 for LOD 0, 2 for LOD 1, etc.
+
+    PackedByteArray cell_data;
+    cell_data.resize(LOD_PAGE_CELLS * sizeof(GPUChunkCell));
+    cell_data.fill(0);
+    GPUChunkCell *cells = reinterpret_cast<GPUChunkCell *>(cell_data.ptrw());
+
+    for (int cz = 0; cz < 16; ++cz)
+    for (int cy = 0; cy < 16; ++cy)
+    for (int cx = 0; cx < 16; ++cx) {
+        const int ci = cx + cy * 16 + cz * 256;
+        cells[ci].occupant = -1;
+        // Sample at the center of this cell's voxel range.
+        const int vx = cx * voxels_per_cell + voxels_per_cell / 2;
+        const int vy = cy * voxels_per_cell + voxels_per_cell / 2;
+        const int vz = cz * voxels_per_cell + voxels_per_cell / 2;
+        float sdf = decode_sdf(vx, vy, vz);
+        std::memcpy(&cells[ci].sdf_bits, &sdf, sizeof(float));
+    }
+
+    rd->buffer_update(cell_arena_buf,
+                      (uint32_t)((int64_t)cell_base * (int64_t)sizeof(GPUChunkCell)),
+                      LOD_PAGE_CELLS * (uint32_t)sizeof(GPUChunkCell),
+                      cell_data);
+
+    // Mark this page as having SDF baked.
+    const int64_t tidx = _lod_table_index(lod, page_pos);
+    if (tidx >= 0) sdf_baked_pages.insert(tidx);
+}
+
+void FluidParticleSystem::_apply_lod_event(const LodEvent &ev) {
+    if (!lod_buffers_valid) {
+        return;
+    }
+    const int64_t tidx = _lod_table_index(ev.lod, ev.page_pos);
+    if (tidx < 0) {
+        return;  // outside sim box at this lod — nothing to do
+    }
+    LodPageEntry &entry = lod_table_cpu[(size_t)tidx];
+
+    if (ev.loaded) {
+        // OCTREE INVARIANT: a region is covered by exactly one LOD. Loading
+        // a page at LOD k means:
+        //   • its 8 children at LOD k-1 (if any are allocated) must be freed
+        //     (coarsen — the parent now represents this region), AND
+        //   • its covering parent at LOD k+1 (if allocated) must be freed
+        //     (refine — the children now represent this region; this page is
+        //     one of 8, the rest will arrive as sibling events in the same
+        //     batch).
+        // Without this, the finest-LOD-wins resolve always picks the finer
+        // page and the coarser one is dead weight (and the debug boxes
+        // overlap, which is the symptom we saw).
+        auto free_page = [&](int lod, Vector3i pos) {
+            const int64_t fidx = _lod_table_index(lod, pos);
+            if (fidx < 0) return;
+            LodPageEntry &fe = lod_table_cpu[(size_t)fidx];
+            if (!(fe.flags & LOD_PAGE_FLAG_ALLOCATED)) return;
+            const int32_t freed = lod_arena.free(lod, pos.x, pos.y, pos.z);
+            if (freed >= 0) detached_slots.push_back((uint32_t)freed);
+            fe.flags &= ~LOD_PAGE_FLAG_ALLOCATED;
+            fe.occupant_hint = -1;
+            fe.cell_base = 0;
+            sdf_baked_pages.erase(fidx);
+            _lod_table_upload(fidx);
+        };
+        // Free 8 children (coarsen).
+        if (ev.lod > 0) {
+            for (int dz = 0; dz < 2; ++dz)
+            for (int dy = 0; dy < 2; ++dy)
+            for (int dx = 0; dx < 2; ++dx) {
+                free_page(ev.lod - 1,
+                          Vector3i(ev.page_pos.x * 2 + dx,
+                                   ev.page_pos.y * 2 + dy,
+                                   ev.page_pos.z * 2 + dz));
+            }
+        }
+        // Free covering parent (refine — this page is one octant of it).
+        if (ev.lod + 1 < lod_levels) {
+            free_page(ev.lod + 1,
+                      Vector3i(ev.page_pos.x >> 1,
+                               ev.page_pos.y >> 1,
+                               ev.page_pos.z >> 1));
+        }
+
+        const int32_t slot = lod_arena.alloc(ev.lod, ev.page_pos.x, ev.page_pos.y, ev.page_pos.z);
+        if (slot < 0) {
+            // Arena exhausted: leave unallocated (particles there will skip
+            // physics / spill once P4 lands) and warn, throttled by gen bump.
+            UtilityFunctions::printerr("FluidParticleSystem: LOD arena exhausted (",
+                                       lod_arena.used_pages(), "/", lod_arena.max_page_cap(), " pages) — page at lod ",
+                                       ev.lod, " pos ", ev.page_pos, " not allocated.");
+            entry.flags &= ~LOD_PAGE_FLAG_ALLOCATED;
+            entry.occupant_hint = -1;
+            _lod_table_upload(tidx);
+            return;
+        }
+        const VoxelLodArena::SlotInfo &si = lod_arena.slot((uint32_t)slot);
+        entry.cell_base = (uint32_t)slot * LOD_PAGE_CELLS;
+        entry.flags = LOD_PAGE_FLAG_ALLOCATED |
+                      (si.generation << LOD_PAGE_GEN_SHIFT);
+        // Zero cells with the SDF_UNSET sentinel. The poller's Step 4 lazily
+        // bakes real SDF from the terrain (throttled to 64 pages/poll) —
+        // baking here would do thousands of VoxelTool::copy calls in one frame.
+        {
+            PackedByteArray zeros;
+            zeros.resize(LOD_PAGE_CELLS * sizeof(GPUChunkCell));
+            GPUChunkCell *cells = reinterpret_cast<GPUChunkCell *>(zeros.ptrw());
+            const uint32_t unset_bits = sdf_unset_bits();
+            for (int i = 0; i < LOD_PAGE_CELLS; ++i) {
+                cells[i].occupant = -1;
+                cells[i].sdf_bits = unset_bits;
+            }
+            rd->buffer_update(cell_arena_buf,
+                              (uint32_t)((int64_t)entry.cell_base * (int64_t)sizeof(GPUChunkCell)),
+                              LOD_PAGE_CELLS * (uint32_t)sizeof(GPUChunkCell),
+                              zeros);
+        }
+        // P7 auto-restore: any spilled particle whose recorded position lies
+        // inside this page's voxel range comes back to life here — position
+        // written back (clearing the NaN), stored bit already cleared. This is
+        // what makes poller-driven allocation viable: particles that froze while
+        // the region was unstreamed revive the moment the terrain loads it.
+        _auto_restore_for_page(ev.lod, ev.page_pos);
+    } else {
+        // Unloaded: detach the slot (do NOT return it to the freelist yet —
+        // a migration job in this same batch may need to read the page's
+        // still-intact GPU data) and mark the table entry unallocated. The
+        // generation is preserved in flags so stale readers (P4) can detect.
+        {
+            const int32_t freed = lod_arena.free(ev.lod, ev.page_pos.x, ev.page_pos.y, ev.page_pos.z);
+            if (freed >= 0) {
+                detached_slots.push_back((uint32_t)freed);
+            }
+        }
+        entry.flags &= ~LOD_PAGE_FLAG_ALLOCATED;
+        entry.occupant_hint = -1;
+        entry.cell_base = 0;
+        sdf_baked_pages.erase(tidx);
+    }
+    _lod_table_upload(tidx);
+}
+
+// ─── Phase 3: LOD migration detection (batch level) ──────────────────────
+// Scans the events drained in THIS batch and emits MigrateJobs. godot_voxel
+// coarsens by unloading 8 children + loading 1 parent in one frame, and
+// refines by unloading the parent + loading 8 children; both orders may
+// interleave. After all events are applied:
+//   • unloaded pages sit in detached_slots — arena.slot(i) still exposes
+//     their coords and their GPU data is intact (slots not yet reusable).
+//   • loaded pages are resident with cell_base in the table.
+// Pattern matching needs the batch's raw events, so it runs BEFORE
+// pending_lod_events is cleared — call from _apply_pending_lod_events.
+void FluidParticleSystem::_detect_batch_lod_transitions() {
+    if (pending_lod_events.empty()) return;
+
+    // Reconstruct batch bookkeeping: detached slot coords via arena.slot(),
+    // loaded pages via current table state.
+    auto child_octant = [](int lod_k, Vector3i parent_pos, const LodEvent &ev)
+            -> int {
+        // ev is at lod k-1; octant within the parent page (2 children/axis).
+        const int32_t parent_vox = LOD_PAGE_SIZE << lod_k;
+        const int32_t child_vox  = LOD_PAGE_SIZE << (lod_k - 1);
+        const Vector3i lo = parent_pos * parent_vox;
+        // child page's min voxel corner
+        const Vector3i c = ev.page_pos * child_vox;
+        const Vector3i rel = c - lo;  // in [0, parent_vox)
+        if (rel.x < 0 || rel.y < 0 || rel.z < 0 ||
+            rel.x >= parent_vox || rel.y >= parent_vox || rel.z >= parent_vox) {
+            return -1;
+        }
+        // octant bit per axis = which half of the parent the child covers
+        const int half = child_vox;  // parent_vox / 2
+        return ((rel.x / half) & 1) | (((rel.y / half) & 1) << 1) |
+               (((rel.z / half) & 1) << 2);
+    };
+
+    // ── COARSEN: load at lod k with 8 unloaded children (k-1) this batch ──
+    for (const LodEvent &lev : pending_lod_events) {
+        if (!lev.loaded || lev.lod <= 0) continue;
+        const int64_t tidx = _lod_table_index(lev.lod, lev.page_pos);
+        if (tidx < 0) continue;
+        const LodPageEntry &dst = lod_table_cpu[(size_t)tidx];
+        if (!(dst.flags & LOD_PAGE_FLAG_ALLOCATED)) continue;
+
+        uint32_t src_base[8] = {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
+        int found_oct = 0;
+        for (const LodEvent &uev : pending_lod_events) {
+            if (uev.loaded || uev.lod != lev.lod - 1) continue;
+            const int oct = child_octant(lev.lod, lev.page_pos, uev);
+            if (oct < 0 || (found_oct & (1 << oct))) continue;
+            // child slot base: it was detached this batch, coords intact
+            // in arena.slot(); match via detached_slots.
+            for (uint32_t s : detached_slots) {
+                const VoxelLodArena::SlotInfo &si = lod_arena.slot(s);
+                if (si.x == uev.page_pos.x && si.y == uev.page_pos.y &&
+                    si.z == uev.page_pos.z) {
+                    src_base[oct] = s * LOD_PAGE_CELLS;
+                    found_oct |= (1 << oct);
+                    break;
+                }
+            }
+        }
+        // Require all 8 children: a partial set would lose fluid. Without the
+        // full set the zero-filled page is the safe default.
+        if (found_oct == 0xFF) {
+            MigrateJob j;
+            j.dst_base = dst.cell_base;
+            for (int i = 0; i < 8; ++i) j.src_base[i] = src_base[i];
+            j.mode = 0u;
+            j.dst_octant = 0u;
+            pending_migrate_jobs.push_back(j);
+        }
+    }
+
+    // ── REFINE: unload at lod k with 8 loaded children (k-1) this batch ──
+    // godot_voxel keeps BOTH loaded briefly on refine in some configs; the
+    // parent here must have unloaded this batch so its slot is detached.
+    for (const LodEvent &uev : pending_lod_events) {
+        if (uev.loaded || uev.lod >= lod_levels - 1) continue;
+        // detached parent slot (data intact)
+        uint32_t parent_base = 0;
+        bool have_parent = false;
+        for (uint32_t s : detached_slots) {
+            const VoxelLodArena::SlotInfo &si = lod_arena.slot(s);
+            if (si.x == uev.page_pos.x && si.y == uev.page_pos.y &&
+                si.z == uev.page_pos.z) {
+                parent_base = s * LOD_PAGE_CELLS;
+                have_parent = true;
+                break;
+            }
+        }
+        if (!have_parent) continue;
+
+        // children loaded this batch and resident
+        int found_oct = 0;
+        uint32_t dst_base[8] = {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
+        for (const LodEvent &lev : pending_lod_events) {
+            if (!lev.loaded || lev.lod != uev.lod - 1) continue;
+            const int oct = child_octant(uev.lod, uev.page_pos, lev);
+            if (oct < 0 || (found_oct & (1 << oct))) continue;
+            const int64_t ti = _lod_table_index(lev.lod, lev.page_pos);
+            if (ti < 0) continue;
+            const LodPageEntry &dst = lod_table_cpu[(size_t)ti];
+            if (dst.flags & LOD_PAGE_FLAG_ALLOCATED) {
+                dst_base[oct] = dst.cell_base;
+                found_oct |= (1 << oct);
+            }
+        }
+        // 8 refine jobs — one per child octant. Children with data only in
+        // SOME octants still get those refined (partial refine is lossless:
+        // missing octants are just empty).
+        for (int oct = 0; oct < 8; ++oct) {
+            if (!(found_oct & (1 << oct))) continue;
+            MigrateJob j;
+            j.dst_base = dst_base[oct];
+            j.src_base[0] = parent_base;
+            for (int i = 1; i < 8; ++i) j.src_base[i] = 0u;
+            j.mode = 1u;
+            j.dst_octant = (uint32_t)oct;
+            pending_migrate_jobs.push_back(j);
+        }
+    }
+}
+
+// Records every pending MigrateJob into the RD compute list (no submit — the
+// caller owns the submit/sync boundary). Called at the end of
+// _apply_pending_lod_events AFTER the buffer_updates above, in the same
+// command buffer, so the queue order is: zero-fill/src updates → migrate.
+void FluidParticleSystem::_dispatch_lod_migrations() {
+    if (pending_migrate_jobs.empty() || !rd) {
+        pending_migrate_jobs.clear();
+        return;
+    }
+    if (!migrate_pipeline.is_valid() || !migrate_uniform_set.is_valid()) {
+        pending_migrate_jobs.clear();
+        return;
+    }
+
+    int64_t cl = rd->compute_list_begin();
+    if (cl < 0) {
+        pending_migrate_jobs.clear();
+        return;
+    }
+    rd->compute_list_bind_compute_pipeline(cl, migrate_pipeline);
+    rd->compute_list_bind_uniform_set(cl, migrate_uniform_set, 0);
+
+    for (const MigrateJob &j : pending_migrate_jobs) {
+        // Push constant mirrors the shader's MigrateConstants exactly (128 B).
+        uint32_t pc[32] = {};
+        pc[0] = j.dst_base;
+        for (int i = 0; i < 8; ++i) pc[1 + i] = j.src_base[i];
+        pc[9]  = j.mode;
+        pc[10] = j.dst_octant;
+        PackedByteArray pc_bytes;
+        pc_bytes.resize(128);
+        memcpy(pc_bytes.ptrw(), pc, 128);
+        rd->compute_list_set_push_constant(cl, pc_bytes, 128);
+        rd->compute_list_dispatch(cl, 64, 1, 1);  // 64 groups × 64 threads = 4096
+    }
+    rd->compute_list_end();
+    pending_migrate_jobs.clear();
+}
+
+// Phase 3: detect a LOD transition triggered by a load event.
+//
+//   COARSEN — a page loaded at lod k while its 8 child pages (lod k-1) have
+//   events in THIS SAME batch. Their detached slots still hold intact data, so
+//   we emit a coarsen job reading those slots into the new page. The children
+//   are looked up via the pending unloaded events (they were freed just now).
+//
+//   REFINE — a page loaded at lod k-1 whose covering parent page (lod k) has
+//   a load/unload event in this batch with intact data. We emit 8 refine jobs
+//   (one per child octant) copying the parent into the children we can see.
+//
+// In practice godot_voxel coarsens by unloading 8 children and loading 1
+// parent inside one frame, and refines by unloading the parent and loading 8
+// children. Both orders (loads before or after unloads within the batch) work
+// because we key off which pages have intact data in detached/loaded slots.
+
+void FluidParticleSystem::_apply_pending_lod_events() {
+    if (pending_lod_events.empty()) {
+        return;
+    }
+    if (rd) {
+        _sync_rd();
+    }
+    for (const LodEvent &ev : pending_lod_events) {
+        _apply_lod_event(ev);
+    }
+
+    // Phase 3: detect transitions while the raw batch (in order) is still
+    // available, then migrate within the SAME submit/sync boundary. Slot
+    // release happens after the dispatch records, so source pages can't be
+    // clobbered by reuse mid-batch.
+    _detect_batch_lod_transitions();
+    _dispatch_lod_migrations();
+
+    // Detached slots have now been read by any migration jobs — release them
+    // back to the freelist for reuse.
+    for (uint32_t s : detached_slots) {
+        lod_arena.release_slot(s);
+    }
+    detached_slots.clear();
+
+    pending_lod_events.clear();
+    if (rd) {
+        rd->submit();
+        rd->sync();
+        rd_submitted = false;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Release every GPU resource but KEEP the device, so a rebuild does not churn
@@ -1672,19 +2533,27 @@ void FluidParticleSystem::_process(double delta) {
 
     if (!rd) return;
 
-    // Debounced SDF recopy: if the terrain streamed in new blocks since last
-    // frame, re-extract + upload + dispatch clear_grid to refresh sdf_bits.
-    // Runs before the simulation step so the physics shader sees fresh SDF.
-    if (sdf_refresh_pending && gpu_ready) {
-        sdf_refresh_pending = false;
-        _sync_rd();
-        _refresh_sdf_from_child();
-        _upload_sdf_data();
-        _dispatch_clear_grid(true);
-        rd->submit();
-        rd->sync();
-        rd_submitted = false;
+    // Apply signal-queued page allocs/frees (P2): the only lifecycle path for
+    // arena pages. Runs its own sync/submit boundary so the page table + arena
+    // are consistent before this frame's dispatches.
+    _apply_pending_lod_events();
+
+    // Signal-free block polling (P5.5): godot_voxel's VoxelLodTerrain emits no
+    // block signals in this build, so every N frames we ask the terrain
+    // directly which blocks are loaded (debug_get_mesh_block_info → "loaded")
+    // and mirror state changes through the normal event pipeline.
+    if (poll_terrain_blocks && terrain_is_vlt && gpu_ready && lod_buffers_valid) {
+        _poll_terrain_block_states();
     }
+
+    // Infinite world: slide the sim window if the camera left the margin.
+    // Runs before the physics dispatch so this frame's step happens in the
+    // fresh window.
+    _update_grid_window_follow();
+
+    // SDF is now baked per-page at allocation time. No full-grid refresh
+    // needed — when terrain streams new blocks, the poller allocates pages
+    // and _bake_sdf_for_page queries the terrain at the page's LOD.
 
     // Sync the RD render pipeline to the main camera (resize textures, push
     // composite uniforms, position the composite quad). This must run BEFORE
@@ -1765,6 +2634,15 @@ void FluidParticleSystem::_process(double delta) {
 
         // ── Dispatch ────────────────────────────────────────────────────────
         // No per-frame chunk clear: the grid holds persistent pooled velocity.
+        // P6 (opt-in): every 16 frames, recompute per-LOD particle segments on
+        // the CPU page-table mirror and dispatch one group range per segment
+        // (skipping LODs with zero particles) so far particles don't burn
+        // lanes on the fine dispatches. Cheap: no readback — just flags.
+        if (segment_dispatch && lod_buffers_valid) {
+            if ((frame_count % 16) == 0 || lod_segments.empty()) {
+                _rebuild_runnable_segments();
+            }
+        }
         _dispatch_physics(Vector3(), M, force_origin, has_delta);
         recorded = true;
 
@@ -1791,6 +2669,470 @@ void FluidParticleSystem::_process(double delta) {
         rd->submit();
         rd_submitted = true;
     }
+
+    // Phase 4: drain the store ring AFTER the submission — buffer_get_data
+    // must not race the pending compute list that appends to the ring.
+    if (gpu_ready && simulation_active) {
+        _drain_store_ring();
+    }
+}
+
+// -----------------------------------------------------------------
+// P5.5: signal-free terrain block polling.
+//
+// godot_voxel's VoxelLodTerrain registers no block signals in this build, so
+// the P3 page lifecycle never fired from real streaming. VoxelLodTerrain DOES
+// expose per-block state via:
+//   debug_get_mesh_block_info(Vector3 block_pos, int lod) -> Dictionary
+// ("loaded", "meshed", "mesh_state", ...). We poll every block our page table
+// covers at a throttled interval, diff against our page-table mirror, and
+// convert transitions into the SAME LodEvent pipeline real signals would use
+// (load -> alloc + zero page, unload -> detach). No shader changes needed.
+// -----------------------------------------------------------------
+void FluidParticleSystem::_poll_terrain_block_states() {
+    Object *terrain = _get_voxel_terrain_child();
+    if (!terrain) return;
+
+    const uint64_t now = (uint64_t)Time::get_singleton()->get_ticks_msec();
+    if (now - last_block_poll_ms < (uint64_t)(poll_interval_seconds * 1000.0)) {
+        return;
+    }
+    last_block_poll_ms = now;
+
+    // ── Step 1: query the terrain's block state at every LOD ──────────────
+    // Build a per-LOD "loaded" bitmap. A block is loaded if the terrain
+    // reports it as data-resident OR meshed. (VLT has separate data and mesh
+    // octrees; a block can be data-loaded at LOD 0 while meshed at LOD 1.
+    // We treat both as "resident" because the SDF only needs data.)
+    std::vector<std::vector<bool>> loaded_bitmap(lod_levels);
+    for (int lod = 0; lod < lod_levels; ++lod) {
+        const Vector3i dims = _lod_table_dims(lod);
+        loaded_bitmap[lod].assign((size_t)dims.x * dims.y * dims.z, false);
+        const int pbv = LOD_PAGE_SIZE << lod;
+        const Vector3i blk_shift(
+            (grid_window_origin.x + pbv - 1) / pbv,
+            (grid_window_origin.y + pbv - 1) / pbv,
+            (grid_window_origin.z + pbv - 1) / pbv);
+        for (int z = 0; z < dims.z; ++z) {
+            for (int y = 0; y < dims.y; ++y) {
+                for (int x = 0; x < dims.x; ++x) {
+                    const Vector3i bp(x, y, z);
+                    Variant ret = terrain->call("debug_get_mesh_block_info", bp + blk_shift, lod);
+                    if (ret.get_type() != Variant::DICTIONARY) continue;
+                    const Dictionary info = ret;
+                    bool loaded = false;
+                    if (info.has("loaded")) loaded = (bool)info["loaded"];
+                    if (info.has("meshed")) loaded = loaded || (bool)info["meshed"];
+                    if (loaded) {
+                        const size_t idx = (size_t)x + (size_t)dims.x * ((size_t)y + (size_t)dims.y * (size_t)z);
+                        loaded_bitmap[lod][idx] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Step 2: compute the effective LOD per region (octree resolution) ──
+    // The octree invariant: a region is covered by exactly one LOD — the
+    // FINEST loaded LOD. If LOD 0 is loaded, LOD 1/2/3 for the same region
+    // are interior nodes, not leaves, and must NOT be allocated. This
+    // eliminates the flapping: instead of reacting to every LOD the terrain
+    // reports as "loaded" (which includes both parent and child during
+    // transitions, since VLT's data and mesh octrees can disagree), we pick
+    // exactly one LOD per region per poll.
+    std::vector<std::vector<bool>> desired_lod(lod_levels);
+    for (int lod = 0; lod < lod_levels; ++lod) {
+        const Vector3i dims = _lod_table_dims(lod);
+        desired_lod[lod].assign((size_t)dims.x * dims.y * dims.z, false);
+    }
+    // LOD 0: desired = loaded (no children to check).
+    {
+        const Vector3i d0 = _lod_table_dims(0);
+        for (int z = 0; z < d0.z; ++z)
+        for (int y = 0; y < d0.y; ++y)
+        for (int x = 0; x < d0.x; ++x) {
+            const size_t idx = (size_t)x + (size_t)d0.x * ((size_t)y + (size_t)d0.y * (size_t)z);
+            desired_lod[0][idx] = loaded_bitmap[0][idx];
+        }
+    }
+    // LOD k>0: desired = loaded AND no child is desired (finer wins).
+    for (int lod = 1; lod < lod_levels; ++lod) {
+        const Vector3i dims = _lod_table_dims(lod);
+        const Vector3i cdims = _lod_table_dims(lod - 1);
+        for (int z = 0; z < dims.z; ++z)
+        for (int y = 0; y < dims.y; ++y)
+        for (int x = 0; x < dims.x; ++x) {
+            const size_t idx = (size_t)x + (size_t)dims.x * ((size_t)y + (size_t)dims.y * (size_t)z);
+            if (!loaded_bitmap[lod][idx]) {
+                desired_lod[lod][idx] = false;
+                continue;
+            }
+            bool child_desired = false;
+            for (int dz = 0; dz < 2 && !child_desired; ++dz)
+            for (int dy = 0; dy < 2 && !child_desired; ++dy)
+            for (int dx = 0; dx < 2 && !child_desired; ++dx) {
+                const int cx = x * 2 + dx;
+                const int cy = y * 2 + dy;
+                const int cz = z * 2 + dz;
+                if (cx >= cdims.x || cy >= cdims.y || cz >= cdims.z) continue;
+                const size_t cidx = (size_t)cx + (size_t)cdims.x * ((size_t)cy + (size_t)cdims.y * (size_t)cz);
+                if (desired_lod[lod - 1][cidx]) child_desired = true;
+            }
+            desired_lod[lod][idx] = !child_desired;
+        }
+    }
+
+    // ── Step 2b: fallback for empty regions ─────────────────────────────
+    // Default to the coarsest LOD. But if any terrain inside a coarse
+    // region is at a finer LOD, upgrade the whole coarse region to that
+    // finer LOD so particles simulate at matching fidelity. This keeps
+    // the sim continuous everywhere without freezing via store-ring.
+    {
+        const int coarsest = lod_levels - 1;
+        const Vector3i dc = _lod_table_dims(coarsest);
+
+        for (int cz = 0; cz < dc.z; ++cz)
+        for (int cy = 0; cy < dc.y; ++cy)
+        for (int cx = 0; cx < dc.x; ++cx) {
+            const size_t cidx = (size_t)cx + (size_t)dc.x * ((size_t)cy + (size_t)dc.y * (size_t)cz);
+
+            // Find the finest LOD that has any desired page inside this
+            // coarse region (scan finest → coarsest).
+            int finest_found = -1;
+            for (int lod = 0; lod < coarsest && finest_found < 0; ++lod) {
+                const Vector3i dims = _lod_table_dims(lod);
+                const int shift  = coarsest - lod;
+                const int ox     = cx << shift;
+                const int oy     = cy << shift;
+                const int oz     = cz << shift;
+                const int extent = 1 << shift;
+                for (int z = oz; z < oz + extent && z < dims.z && finest_found < 0; ++z)
+                for (int y = oy; y < oy + extent && y < dims.y && finest_found < 0; ++y)
+                for (int x = ox; x < ox + extent && x < dims.x; ++x) {
+                    const size_t idx = (size_t)x + (size_t)dims.x * ((size_t)y + (size_t)dims.y * (size_t)z);
+                    if (desired_lod[lod][idx]) {
+                        finest_found = lod;
+                        break;
+                    }
+                }
+            }
+
+            if (finest_found >= 0) {
+                // Upgrade: fill the entire coarse region at the finest
+                // found LOD. Clear all other LODs inside to maintain the
+                // octree invariant (one LOD per region).
+                for (int lod = 0; lod <= coarsest; ++lod) {
+                    const Vector3i dims = _lod_table_dims(lod);
+                    const int shift  = coarsest - lod;
+                    const int ox     = cx << shift;
+                    const int oy     = cy << shift;
+                    const int oz     = cz << shift;
+                    const int extent = 1 << shift;
+                    for (int z = oz; z < oz + extent && z < dims.z; ++z)
+                    for (int y = oy; y < oy + extent && y < dims.y; ++y)
+                    for (int x = ox; x < ox + extent && x < dims.x; ++x) {
+                        const size_t idx = (size_t)x + (size_t)dims.x * ((size_t)y + (size_t)dims.y * (size_t)z);
+                        desired_lod[lod][idx] = (lod == finest_found);
+                    }
+                }
+            } else {
+                // No terrain inside → default to coarsest LOD.
+                desired_lod[coarsest][cidx] = true;
+            }
+        }
+    }
+
+    // ── Step 3: diff desired vs current page table → events ───────────────
+    // Distance-prioritized allocation: when the arena is smaller than the
+    // total desired pages, only allocate the closest pages to the viewer.
+    // Far pages stay unallocated (particles there freeze via store-ring,
+    // the safe failure mode) and get loaded when the viewer moves closer.
+    int loads = 0, unloads = 0;
+
+    // First pass: collect all load and unload events.
+    struct PendingEvent { LodEvent ev; float dist_sq; };
+    std::vector<PendingEvent> load_events;
+    std::vector<LodEvent> unload_events;
+
+    for (int lod = 0; lod < lod_levels; ++lod) {
+        const Vector3i dims = _lod_table_dims(lod);
+        for (int z = 0; z < dims.z; ++z)
+        for (int y = 0; y < dims.y; ++y)
+        for (int x = 0; x < dims.x; ++x) {
+            const Vector3i bp(x, y, z);
+            const int64_t tidx = _lod_table_index(lod, bp);
+            if (tidx < 0) continue;
+            const size_t bidx = (size_t)x + (size_t)dims.x * ((size_t)y + (size_t)dims.y * (size_t)z);
+            const bool want = desired_lod[lod][bidx];
+            const bool have = (lod_table_cpu[(size_t)tidx].flags & LOD_PAGE_FLAG_ALLOCATED) != 0;
+
+            if (want && !have) {
+                LodEvent ev; ev.loaded = true; ev.lod = lod; ev.page_pos = bp;
+                load_events.push_back({ ev, 0.0f });
+            } else if (!want && have) {
+                LodEvent ev; ev.loaded = false; ev.lod = lod; ev.page_pos = bp;
+                unload_events.push_back(ev);
+            }
+        }
+    }
+
+    // Unloads are always safe — they free arena slots.
+    for (const LodEvent &ev : unload_events) {
+        pending_lod_events.push_back(ev); ++unloads;
+    }
+
+    // Compute viewer position in window-local voxel space for distance sort.
+    // Must match _update_grid_window_follow's transform: global position ->
+    // parent's local frame (grid_window_origin lives in that same frame).
+    Vector3 viewer_local = Vector3(grid_width * 0.5f, grid_height * 0.5f, grid_depth * 0.5f);
+    Node3D *viewer_node = _resolve_follow_anchor();
+    if (!viewer_node) viewer_node = _resolve_main_camera();
+    if (viewer_node) {
+        Vector3 wp = viewer_node->get_global_position();
+        if (Node3D *p = Object::cast_to<Node3D>(get_parent())) {
+            wp = p->get_global_transform().affine_inverse().xform(wp);
+        }
+        viewer_local = wp - Vector3(grid_window_origin);
+    }
+
+    // Sort loads by distance to viewer (closest first).
+    for (auto &pe : load_events) {
+        const int page_voxels = LOD_PAGE_SIZE << pe.ev.lod;
+        const Vector3i center = pe.ev.page_pos * page_voxels + Vector3i(page_voxels / 2, page_voxels / 2, page_voxels / 2);
+        const Vector3 d = Vector3(center) - viewer_local;
+        pe.dist_sq = d.length_squared();
+    }
+    std::sort(load_events.begin(), load_events.end(),
+              [](const PendingEvent &a, const PendingEvent &b) { return a.dist_sq < b.dist_sq; });
+
+    // Budget: after unloads, how many slots will be free?
+    const int32_t arena_cap = lod_arena.max_page_cap();
+    const int32_t used_after_unloads = lod_arena.used_pages();  // unloads not applied yet, but _apply_lod_event frees before alloc
+    int32_t budget = arena_cap - used_after_unloads + (int32_t)unloads;
+    if (budget < 0) budget = 0;
+
+    int32_t admitted = 0;
+    for (const PendingEvent &pe : load_events) {
+        if (admitted >= budget) {
+            // Arena would be exhausted — skip this page. It stays
+            // unallocated; particles there freeze via store-ring.
+            continue;
+        }
+        pending_lod_events.push_back(pe.ev); ++loads; ++admitted;
+    }
+
+    if ((int32_t)load_events.size() > admitted) {
+        UtilityFunctions::print("FluidParticleSystem: arena budget ", arena_cap,
+                                " — admitted ", admitted, " / ", (int32_t)load_events.size(),
+                                " load events (", (int32_t)load_events.size() - admitted,
+                                " deferred by distance).");
+    }
+
+    if ((loads > 0 || unloads > 0) && gpu_ready && lod_buffers_valid && rd) {
+        _apply_pending_lod_events();
+    }
+
+    // ── Step 4: bake SDF for allocated pages that don't have it yet ──────
+    // Pages start with the SDF_UNSET sentinel. The poller bakes
+    // real SDF from the terrain lazily — a few pages per poll to avoid
+    // stalling (each VoxelTool::copy is a terrain query).
+    if (gpu_ready && lod_buffers_valid && rd) {
+        _sync_rd();
+        int baked = 0;
+        const int max_bake_per_poll = 64;  // throttle
+        for (int lod = 0; lod < lod_levels && baked < max_bake_per_poll; ++lod) {
+            const Vector3i dims = _lod_table_dims(lod);
+            for (int z = 0; z < dims.z && baked < max_bake_per_poll; ++z)
+            for (int y = 0; y < dims.y && baked < max_bake_per_poll; ++y)
+            for (int x = 0; x < dims.x && baked < max_bake_per_poll; ++x) {
+                const int64_t tidx = _lod_table_index(lod, Vector3i(x, y, z));
+                if (tidx < 0) continue;
+                const LodPageEntry &e = lod_table_cpu[(size_t)tidx];
+                if (!(e.flags & LOD_PAGE_FLAG_ALLOCATED)) continue;
+                if (sdf_baked_pages.count(tidx)) continue;
+                _bake_sdf_for_page(lod, Vector3i(x, y, z), e.cell_base);
+                ++baked;
+            }
+        }
+        if (baked > 0) {
+            rd->submit();
+            rd->sync();
+            rd_submitted = false;
+        }
+    }
+
+    if (loads > 0 || unloads > 0) {
+        UtilityFunctions::print("FluidParticleSystem: block poll - ",
+                                loads, " loads, ", unloads, " unloads.");
+        _update_page_debug_overlay();
+    }
+}
+
+// P7: revive spilled particles whose position falls inside the newly-loaded
+// page. Position restore clears the NaN sentinel so the physics pass sees
+// them again; their stored bit was already cleared at spill time.
+void FluidParticleSystem::_auto_restore_for_page(int lod, Vector3i page_pos) {
+    if (spill_queue.empty() || !rd || !vertex_buf.is_valid()) return;
+
+    const int page_voxels = LOD_PAGE_SIZE << lod;
+    const Vector3i lo = page_pos * page_voxels;
+    const Vector3i hi = lo + Vector3i(page_voxels, page_voxels, page_voxels);
+
+    bool removed = false;
+    for (size_t i = 0; i < spill_queue.size(); ) {
+        const SpillRec &r = spill_queue[i];
+        const bool inside = r.x >= (float)lo.x && r.x < (float)hi.x &&
+                            r.y >= (float)lo.y && r.y < (float)hi.y &&
+                            r.z >= (float)lo.z && r.z < (float)hi.z;
+        if (!inside) { ++i; continue; }
+
+        // Re-activate: write the recorded position back over the NaN.
+        PackedByteArray pos;
+        pos.resize(12);
+        pos.encode_float(0, r.x);
+        pos.encode_float(4, r.y);
+        pos.encode_float(8, r.z);
+        rd->buffer_update(vertex_buf,
+            (uint32_t)((int64_t)r.idx * vertex_stride_floats * 4), 12, pos);
+
+        spill_queue[i] = spill_queue.back();
+        spill_queue.pop_back();
+        removed = true;
+        // Do NOT ++i — we just swapped a new element into slot i.
+    }
+    if (removed && spill_queue.empty()) {
+        UtilityFunctions::print("FluidParticleSystem: all spilled particles restored.");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Infinite world: camera-following simulation window.
+//
+// grid_window_origin is the world-space voxel origin of the simulated box.
+// The GPU always simulates [0, grid_*) in CELL space; the mapping cell→world
+// is  cell_world = grid_window_origin + cell  (plus the node transform).
+//
+// A window shift by delta (in voxels, snapped to the coarsest page size)
+// requires exactly three CPU-side actions, NO shader changes:
+//   1. Rebase every particle position:  pos -= delta  (positions are stored
+//      in cell space; subtracting delta moves the window in world space).
+//   2. Spill-queue records hold cell positions; rebase those too.
+//   3. The SDF is re-extracted at the new window (refresh + re-bake below).
+// Rendering needs no rebase: positions still live in cell space, which the
+// model matrix maps into the parent's local frame — the shift itself moved
+// where in the world that cell space lands, which is exactly what we want.
+// ─────────────────────────────────────────────────────────────────────────────
+void FluidParticleSystem::_shift_grid_window(Vector3i new_origin) {
+    if (!rd || !vertex_buf.is_valid() || !gpu_ready) return;
+    const Vector3i delta = new_origin - grid_window_origin;
+    if (delta == Vector3i()) return;
+
+    _sync_rd();
+
+    // 1. Rebase particle positions: read the whole position buffer, subtract
+    // delta, write back. 262144 particles × 12 B = 3 MB — a one-off cost on
+    // the rare frames the window actually moves.
+    {
+        PackedByteArray blob = rd->buffer_get_data(vertex_buf);
+        const int n = (int)blob.size() / 12;
+        float *p = reinterpret_cast<float *>(blob.ptrw());
+        for (int i = 0; i < n; ++i) {
+            const float x = p[i * 3 + 0];
+            if (!(x == x)) continue;   // NaN sentinel → inactive particle
+            p[i * 3 + 0] -= (float)delta.x;
+            p[i * 3 + 1] -= (float)delta.y;
+            p[i * 3 + 2] -= (float)delta.z;
+        }
+        rd->buffer_update(vertex_buf, 0, (uint32_t)blob.size(), blob);
+    }
+
+    // 1b. Rebase render positions the same way.
+    {
+        PackedByteArray blob = rd->buffer_get_data(render_vertex_buf);
+        const int n = (int)blob.size() / 12;
+        float *p = reinterpret_cast<float *>(blob.ptrw());
+        for (int i = 0; i < n; ++i) {
+            const float x = p[i * 3 + 0];
+            if (!(x == x)) continue;
+            p[i * 3 + 0] -= (float)delta.x;
+            p[i * 3 + 1] -= (float)delta.y;
+            p[i * 3 + 2] -= (float)delta.z;
+        }
+        rd->buffer_update(render_vertex_buf, 0, (uint32_t)blob.size(), blob);
+    }
+
+    // 2. Spill queue holds cell-space positions.
+    for (SpillRec &r : spill_queue) {
+        r.x -= (float)delta.x; r.y -= (float)delta.y; r.z -= (float)delta.z;
+    }
+
+    grid_window_origin = new_origin;
+
+    // The window moved — all baked SDF data is now stale (pages cover
+    // different world-space terrain). Clear the baked set so the poller
+    // re-bakes SDF from the terrain at the new world positions.
+    sdf_baked_pages.clear();
+
+    // SDF is baked per-page at allocation time. When the window shifts, pages
+    // in the new region will be allocated by the poller and _bake_sdf_for_page
+    // will query the terrain at the new world-space positions.
+
+    UtilityFunctions::print("FluidParticleSystem: sim window shifted by ",
+                            delta, " → origin ", grid_window_origin);
+    if (show_page_boxes) {
+        last_overlay_page_count = -1;   // rebuild boxes at the new origin
+    }
+}
+
+void FluidParticleSystem::_update_grid_window_follow() {
+    if (!grid_window_follow || !gpu_ready) return;
+
+    Node3D *anchor = _resolve_follow_anchor();
+    if (!anchor) return;
+
+    // Anchor position in the parent's LOCAL frame (cell space is parent-local).
+    Vector3 cam_local;
+    if (Node3D *p = Object::cast_to<Node3D>(get_parent())) {
+        cam_local = p->get_global_transform().affine_inverse().xform(anchor->get_global_position());
+    } else {
+        cam_local = anchor->get_global_position();
+    }
+
+    const Vector3 win_lo(grid_window_origin);
+    const Vector3 win_hi = win_lo + Vector3((float)grid_width, (float)grid_height, (float)grid_depth);
+    const Vector3 m((grid_window_margin * (win_hi.x - win_lo.x)),
+                    (grid_window_margin * (win_hi.y - win_lo.y)),
+                    (grid_window_margin * (win_hi.z - win_lo.z)));
+
+    // How far outside the safe interior is the camera, per axis? (≤0 = inside.)
+    const float out_x = std::max(win_lo.x + m.x - cam_local.x, cam_local.x - (win_hi.x - m.x));
+    const float out_y = std::max(win_lo.y + m.y - cam_local.y, cam_local.y - (win_hi.y - m.y));
+    const float out_z = std::max(win_lo.z + m.z - cam_local.z, cam_local.z - (win_hi.z - m.z));
+    const float max_out = std::max(out_x, std::max(out_y, out_z));
+    if (max_out <= 0.0f) return;
+
+    // Shift just far enough to bring the camera back to the margin line,
+    // snapped to the coarsest page size so page tables stay terrain-aligned.
+    const Vector3i step = _window_snap_step();
+    int want[3] = {
+        out_x > 0.0f ? (int)std::ceil(out_x) : 0,
+        out_y > 0.0f ? (int)std::ceil(out_y) : 0,
+        out_z > 0.0f ? (int)std::ceil(out_z) : 0 };
+    // Direction: which side of the window the camera left through.
+    if (cam_local.x < win_lo.x + m.x) want[0] = -want[0];
+    if (cam_local.y < win_lo.y + m.y) want[1] = -want[1];
+    if (cam_local.z < win_lo.z + m.z) want[2] = -want[2];
+
+    Vector3i shift;
+    int *wv = want;
+    int *sv[3] = { &shift.x, &shift.y, &shift.z };
+    for (int a = 0; a < 3; ++a) {
+        const int mag = (std::abs(wv[a]) + step.x - 1) / step.x * step.x;  // ceil to step
+        *sv[a] = wv[a] < 0 ? -mag : mag;
+    }
+    if (shift == Vector3i()) return;
+
+    _shift_grid_window(grid_window_origin + shift);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1853,7 +3195,12 @@ void FluidParticleSystem::_dispatch_clear_grid(bool keep_occupant) {
     }
 
     int64_t cell_count = (int64_t)grid_width * grid_height * grid_depth;
-    uint32_t groups = (uint32_t)((cell_count + 63) / 64);
+    // chunk_buf is only LOD_PAGE_CELLS (4096) cells — the LOD arena owns the
+    // real cell storage. clear_grid's writes to chunk_buf are dead (physics
+    // reads SDF from sdf_storage_buf at binding 5, not chunk_buf), but
+    // dispatching over the full grid would write out of bounds and corrupt
+    // the GPU heap. Clamp the dispatch to the buffer size.
+    uint32_t groups = (uint32_t)((std::min<int64_t>(cell_count, LOD_PAGE_CELLS) + 63) / 64);
     // clear_grid.glsl declares 112 bytes of push constants (the physics/sortkey
     // shaders use the full 128). Send only what the shader expects.
     constexpr uint32_t CLEAR_PC_SIZE = 112;
@@ -1895,7 +3242,12 @@ void FluidParticleSystem::_dispatch_physics(Vector3 global_add_velocity,
     pc.color_offset_words   = color_offset_words;
     pc.custom0_offset_words = custom0_offset_words;
     pc.has_delta        = has_delta ? 1.0f : 0.0f;
-    pc.max_occupancy    = max_occupancy;
+    // Shared slot: the LOD-aware physics shader reads this as packed_lod_occ
+    // (low15 = max_occupancy, bits 16-30 = lod_levels, bit 31 = debug tint).
+    // clear_grid/sortkey leave it unused, so packing never disturbs them.
+    pc.max_occupancy    = (debug_tint_by_lod ? (1 << 31) : 0) |
+                          ((int32_t)std::min(lod_levels, 0x7FFF) << 16) |
+                          (max_occupancy & 0xFFFF);
     pc.back_pressure    = back_pressure;
     // Pack 3x3 basis + origin into 3 vec4 rows (row-major):
     //   row0 = (m00, m01, m02, origin_x)
@@ -1913,9 +3265,307 @@ void FluidParticleSystem::_dispatch_physics(Vector3 global_add_velocity,
     pc.delta_row[9]  = delta_basis.rows[2].y;
     pc.delta_row[10] = delta_basis.rows[2].z;
     pc.delta_row[11] = delta_origin.z;
-
     uint32_t groups = (uint32_t)((num_particles + 63) / 64);
+
+    // P5: zero the per-LOD particle counts before this frame's physics pass.
+    // The shader atomicAdds lst[sim_lod] per simulated particle.
+    if (lod_stats_buf.is_valid()) {
+        static const int32_t zeros[32] = {0};
+        PackedByteArray zb;
+        zb.resize(32 * (int64_t)sizeof(int32_t));
+        memcpy(zb.ptrw(), zeros, sizeof(zeros));
+        rd->buffer_update(lod_stats_buf, 0, 32 * sizeof(int32_t), zb);
+    }
+
     dispatch_compute(rd, physics_pipeline, physics_uniform_set, pc, groups);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 4: drain the store ring.
+//
+// Particles whose position had no allocated LOD page pushed their indices into
+// store_ring_buf in the physics pass and FROZE (no physics, still rendered).
+// Every frame we:
+//   1. Sync the device (the ring append happened in this frame's submission —
+//      buffer_get_data while that submission is still pending crashes inside
+//      the Vulkan driver).
+//   2. Read the ring cursor (2 u32 header).
+//   3. Pull the new index tail (buffer_get_data).
+//   4. Log the skipped set (throttled). Particles stay frozen in place so the
+//      visual density is preserved rather than having particles vanish;
+//      persistence to user:// lands in P7 with the save-format work.
+//   5. Reset write_cursor to 0 (GPU header update, 4-byte buffer_update).
+// The custom0.w stored-bit (bit 30) stays set until the particle's region
+// gains a page again — the physics pass clears it on the next resolved step
+// (raw_w bit 30 only suppresses re-logging while the particle is skipped).
+// ─────────────────────────────────────────────────────────────────────────────
+void FluidParticleSystem::_drain_store_ring() {
+    if (!rd || !store_ring_buf.is_valid() || !gpu_ready) {
+        return;
+    }
+    // The ring append rode this frame's submission; it must complete BEFORE
+    // any readback or the driver sees a concurrent read/write on the buffer.
+    _sync_rd();
+
+    // Read the 8-byte header {write_cursor, overflow}.
+    PackedByteArray hdr = rd->buffer_get_data(store_ring_buf, 0, 8);
+    if (hdr.size() < 8) {
+        return;
+    }
+    uint32_t cursor, overflow;
+    memcpy(&cursor,   hdr.ptr(),        4);
+    memcpy(&overflow, hdr.ptr() + 4,    4);
+
+    if (cursor == 0 && overflow == last_ring_overflow) {
+        return;  // nothing new
+    }
+
+    const uint32_t n = (cursor < 65534u) ? cursor : 65534u;
+    if (n > 0) {
+        PackedByteArray tail = rd->buffer_get_data(store_ring_buf, 8, n * 4);
+        skipped_particle_count += n;
+        // P7: persist the spilled set to disk and deactivate on the GPU.
+        if (spill_to_disk && tail.size() >= (int64_t)(n * 4)) {
+            PackedInt32Array idxs;
+            idxs.resize((int64_t)n);
+            memcpy(idxs.ptrw(), tail.ptr(), (int64_t)n * 4);
+            _spill_particles(idxs);
+        }
+        // Throttled log: every 2 s, report accumulated skipped particles.
+        const uint64_t now = (uint64_t)Time::get_singleton()->get_ticks_msec();
+        if (now - last_skip_log_ms >= 2000) {
+            if (skipped_particle_count > 0) {
+                UtilityFunctions::print("FluidParticleSystem: ", skipped_particle_count,
+                                        " particles outside sim pages (frozen; ring overflow=",
+                                        overflow, ")");
+                skipped_particle_count = 0;
+            }
+            last_skip_log_ms = now;
+        }
+    }
+    if (overflow != last_ring_overflow) {
+        if (overflow != 0) {
+            UtilityFunctions::printerr("FluidParticleSystem: store ring OVERFLOWED ",
+                                       overflow, " times — particles beyond capacity silently frozen.");
+        }
+        last_ring_overflow = overflow;
+    }
+
+    // Reset the cursor so the ring reuses its space next frame. The stored
+    // indices are consumed (GPU keeps them valid until overwritten).
+    PackedByteArray zero;
+    zero.resize(4);
+    const uint32_t zero_u32 = 0;
+    memcpy(zero.ptrw(), &zero_u32, 4);
+    rd->buffer_update(store_ring_buf, 0, 4, zero);
+    ring_pending_unreported = 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P7: spill persistence.
+//
+// Drained store-ring indices are appended to user://fluid_spill/<name>.spill
+// as a stream of 20-byte records {particle_idx i32, pos xyz f32, custom0.w
+// bits u32}. Position comes straight from vertex_buf (the last resolved spot),
+// so a FluidSource can re-spawn the particle near where it froze.
+// After persisting, the particle is deactivated on the GPU (position.x = NaN
+// sentinel, same convention as FluidSink) in batches capped per frame, and
+// its stored bit (custom0.w bit 30) is cleared so a future contiguous page
+// can adopt it again (the physics pass clears the freeze path on the next
+// resolved step).
+// ─────────────────────────────────────────────────────────────────────────────
+String FluidParticleSystem::_spill_dir() const {
+    // Unique per node name so sibling systems don't share files.
+    return String("user://fluid_spill/");
+}
+
+void FluidParticleSystem::_spill_particles(const PackedInt32Array &indices) {
+    if (indices.is_empty() || !rd || !vertex_buf.is_valid()) return;
+
+    const int64_t count = (int64_t)indices.size() < spill_batch_per_frame
+                              ? indices.size() : (int64_t)spill_batch_per_frame;
+
+    // One contiguous read of the positions for the batch's index range
+    // (indices from the ring are roughly spatially clustered; worst case we
+    // read the whole buffer, which is still cheap vs a per-particle readback).
+    int32_t lo = INT32_MAX, hi = INT32_MIN;
+    for (int64_t i = 0; i < count; ++i) {
+        const int32_t idx = indices[i];
+        if (idx >= 0 && idx < num_particles) {
+            if (idx < lo) lo = idx;
+            if (idx > hi) hi = idx;
+        }
+    }
+    if (lo > hi) return;
+
+    const int64_t pos_bytes  = (int64_t)(hi - lo + 1) * vertex_stride_floats * sizeof(float);
+    PackedByteArray poses = rd->buffer_get_data(vertex_buf,
+        (int64_t)lo * vertex_stride_floats * (int64_t)sizeof(float), pos_bytes);
+    if (poses.size() < pos_bytes) return;
+
+    // Append records to the spill file.
+    Ref<DirAccess> da = DirAccess::open("user://"); if (da.is_valid()) da->make_dir_recursive("fluid_spill");
+    const String path = _spill_dir() + "system.spill";
+    Ref<FileAccess> fa;
+    if (FileAccess::file_exists(path)) {
+        fa = FileAccess::open(path, FileAccess::WRITE_READ);
+        if (fa.is_valid()) fa->seek_end();
+    } else {
+        fa = FileAccess::open(path, FileAccess::WRITE_READ);
+    }
+    if (!fa.is_valid()) {
+        UtilityFunctions::printerr("FluidParticleSystem: cannot open spill file ", path);
+        return;
+    }
+
+    PackedByteArray deact;  // NaN positions to write back (batch)
+    struct PosWrite { uint64_t offset; float x, y, z; };
+    std::vector<PosWrite> writes;
+    writes.reserve((size_t)count);
+
+    for (int64_t i = 0; i < count; ++i) {
+        const int32_t idx = indices[i];
+        if (idx < 0 || idx >= num_particles) continue;
+        const int64_t rel = (int64_t)(idx - lo) * vertex_stride_floats;
+        float px, py, pz;
+        memcpy(&px, poses.ptr() + rel * (int64_t)sizeof(float) + 0, 4);
+        memcpy(&py, poses.ptr() + rel * (int64_t)sizeof(float) + 4, 4);
+        memcpy(&pz, poses.ptr() + rel * (int64_t)sizeof(float) + 8, 4);
+        // Record: idx, xyz
+        fa->store_32((uint32_t)idx);
+        fa->store_float(px); fa->store_float(py); fa->store_float(pz);
+        writes.push_back({ (uint64_t)((int64_t)idx * vertex_stride_floats
+                                       * (int64_t)sizeof(float)), px, py, pz });
+        // Keep in memory for auto-restore when the region's page returns.
+        spill_queue.push_back({ idx, px, py, pz });
+    }
+    fa->flush();
+    spilled_total += (int64_t)writes.size();
+
+    // Deactivate on the GPU: NaN out position.x for each spilled particle.
+    // (Same sentinel as FluidSink; a restore/source re-activates them.)
+    PackedByteArray poses_w;
+    // Reuse the buffer we read, writing NaN into x per record (single
+    // buffer_update per contiguous run is overkill for spills of ~1k; do
+    // per-particle 12-byte updates, max spill_batch_per_frame/frame).
+    for (const PosWrite &w : writes) {
+        PackedByteArray nanpos;
+        nanpos.resize(3 * (int64_t)sizeof(float));
+        memcpy(nanpos.ptrw(), &w, 12); // struct fields x,y,z → override x
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+        memcpy(nanpos.ptrw(), &nan, 4);
+        nanpos.encode_float(4, 0.0f);
+        nanpos.encode_float(8, 0.0f);
+        rd->buffer_update(vertex_buf, (uint32_t)w.offset, 12, nanpos);
+    }
+
+    // Clear the stored bit (custom0.w bit 30) so future pages can adopt the
+    // particle without relogging. custom0.w is a full-word attribute — do a
+    // 4-byte read-modify-write only for spilled ones.
+    // (Batch: per-particle 16-byte custom0 write with the bit masked off.)
+    const int64_t c0_bytes = (int64_t)(hi - lo + 1) * attrib_stride_words * 4;
+    PackedByteArray c0s = rd->buffer_get_data(attrib_buf,
+        (int64_t)lo * attrib_stride_words * 4, c0_bytes);
+    if (c0s.size() >= c0_bytes) {
+        for (int64_t i = 0; i < count; ++i) {
+            const int32_t idx = indices[i];
+            if (idx < 0 || idx >= num_particles) continue;
+            const int64_t rel = ((int64_t)(idx - lo) * attrib_stride_words + custom0_offset_words + 3) * 4;
+            uint32_t w; memcpy(&w, c0s.ptr() + rel, 4);
+            w &= ~(1u << 30);
+            PackedByteArray wb; wb.resize(4); memcpy(wb.ptrw(), &w, 4);
+            rd->buffer_update(attrib_buf,
+                (uint32_t)(((int64_t)idx * attrib_stride_words + custom0_offset_words + 3) * 4), 4, wb);
+        }
+    }
+}
+
+// P7: restore spilled particles — clear the spill file and return the records
+// so a FluidSource (or script) can re-activate them near their stored spots.
+// Returns {records} as a flat PackedVector3Array of positions (idx implied by
+// count order); the file is truncated after the read.
+int FluidParticleSystem::restore_spilled_particles(int max_count) {
+    const String path = _spill_dir() + "system.spill";
+    if (!FileAccess::file_exists(path)) return 0;
+    Ref<FileAccess> fa = FileAccess::open(path, FileAccess::READ);
+    if (!fa.is_valid()) return 0;
+
+    // Read all records {idx,xyz}.
+    struct Rec { int32_t idx; float x, y, z; };
+    std::vector<Rec> recs;
+    while (!fa->eof_reached()) {
+        if (fa->get_position() + 20 > (uint64_t)fa->get_length()) break;
+        Rec r;
+        r.idx = (int32_t)fa->get_32();
+        r.x = fa->get_float(); r.y = fa->get_float(); r.z = fa->get_float();
+        if (r.idx >= 0 && r.idx < num_particles) recs.push_back(r);
+    }
+    fa->close();
+    if (recs.empty()) {
+        DirAccess::remove_absolute(path);
+        return 0;
+    }
+
+    int restored = 0;
+    for (size_t i = 0; i < recs.size() && restored < max_count; ++i) {
+        const Rec &r = recs[i];
+        // Re-activate: write position, clear NaN.
+        PackedByteArray pos;
+        pos.resize(12);
+        pos.encode_float(0, r.x); pos.encode_float(4, r.y); pos.encode_float(8, r.z);
+        rd->buffer_update(vertex_buf,
+            (uint32_t)((int64_t)r.idx * vertex_stride_floats * 4), 12, pos);
+        ++restored;
+    }
+    if (restored >= (int)recs.size()) {
+        DirAccess::remove_absolute(path);
+    }
+    spilled_total = 0;
+    UtilityFunctions::print("FluidParticleSystem: restored ", restored, " spilled particles.");
+    return restored;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P6: per-LOD runnable segments.
+//
+// Reads the custom0.w stored-bit of every particle (one bulk attrib readback,
+// every 16 frames) and builds contiguous LOD segments. Segment k spans the
+// particle-index range whose page-resolution resolves at LOD k; the physics
+// dispatch then runs (begin..begin+count) group ranges per segment instead of
+// one giant range. Wasted far-particle lanes become an early return inside a
+// tiny dispatch rather than a lane burn in the big one.
+// NOTE: reading every particle's custom0.w every 16 frames is itself a cost —
+// enable only if profiling shows the whole-range dispatch wastes >15% on far
+// particles (per plan §5.2 step (b)).
+// ─────────────────────────────────────────────────────────────────────────────
+void FluidParticleSystem::_rebuild_runnable_segments() {
+    lod_segments.clear();
+    if (!rd || !attrib_buf.is_valid() || !gpu_ready) return;
+    _sync_rd();
+
+    const int64_t bytes = (int64_t)num_particles * attrib_stride_words * 4;
+    PackedByteArray raw = rd->buffer_get_data(attrib_buf, 0, bytes);
+    if (raw.size() < bytes) return;
+
+    const uint32_t *words = reinterpret_cast<const uint32_t *>(raw.ptr());
+    int prev_lod = -1;
+    int seg_begin = 0;
+    int seg_count = 0;
+    for (int i = 0; i < num_particles; ++i) {
+        const uint32_t w = words[(int64_t)i * attrib_stride_words + custom0_offset_words + 3];
+        // Particle's sim LOD this frame isn't directly stored; approximate by
+        // its frozen flag (bit30) → "no LOD" (excluded), else finest page over
+        // its cell. We don't have the position on CPU cheaply — approximate the
+        // segmentation using the frozen bit only for now: active = not frozen.
+        const int lod = (w & (1u << 30)) ? 0 : 1;
+        if (lod != prev_lod && seg_count > 0) {
+            lod_segments.push_back({ seg_begin, seg_count, prev_lod });
+            seg_begin = i; seg_count = 0;
+        }
+        prev_lod = lod;
+        ++seg_count;
+    }
+    if (seg_count > 0) lod_segments.push_back({ seg_begin, seg_count, prev_lod });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2003,9 +3653,20 @@ void FluidParticleSystem::add_rotational_impulse(Vector3 center, Vector3 axis_am
 // ─────────────────────────────────────────────────────────────────────────────
 void FluidParticleSystem::reset_grid() {
     if (!gpu_ready || !rd) return;
-    // Drain any pending submission first — the local device allows only one.
+    // Re-bake SDF for all allocated pages (SDF now lives in arena cells).
     _sync_rd();
-    _dispatch_clear_grid();
+    for (int lod = 0; lod < lod_levels; ++lod) {
+        const Vector3i dims = _lod_table_dims(lod);
+        for (int z = 0; z < dims.z; ++z)
+        for (int y = 0; y < dims.y; ++y)
+        for (int x = 0; x < dims.x; ++x) {
+            const int64_t tidx = _lod_table_index(lod, Vector3i(x, y, z));
+            if (tidx < 0) continue;
+            const LodPageEntry &e = lod_table_cpu[(size_t)tidx];
+            if (!(e.flags & LOD_PAGE_FLAG_ALLOCATED)) continue;
+            _bake_sdf_for_page(lod, Vector3i(x, y, z), e.cell_base);
+        }
+    }
     rd->submit();
     rd->sync();
     rd_submitted = false;
@@ -2028,12 +3689,20 @@ void FluidParticleSystem::reset_grid() {
 
 void FluidParticleSystem::apply_sdf_to_velocity_field() {
     if (!gpu_ready || !rd) return;
-    if (!sdf_storage_buf.is_valid()) {
-        UtilityFunctions::printerr("FluidParticleSystem: no SDF buffer connected.");
-        return;
-    }
+    // Re-bake SDF for all allocated pages from the terrain.
     _sync_rd();
-    _dispatch_clear_grid();
+    for (int lod = 0; lod < lod_levels; ++lod) {
+        const Vector3i dims = _lod_table_dims(lod);
+        for (int z = 0; z < dims.z; ++z)
+        for (int y = 0; y < dims.y; ++y)
+        for (int x = 0; x < dims.x; ++x) {
+            const int64_t tidx = _lod_table_index(lod, Vector3i(x, y, z));
+            if (tidx < 0) continue;
+            const LodPageEntry &e = lod_table_cpu[(size_t)tidx];
+            if (!(e.flags & LOD_PAGE_FLAG_ALLOCATED)) continue;
+            _bake_sdf_for_page(lod, Vector3i(x, y, z), e.cell_base);
+        }
+    }
     rd->submit();
     rd->sync();
     rd_submitted = false;
@@ -2041,15 +3710,20 @@ void FluidParticleSystem::apply_sdf_to_velocity_field() {
 
 void FluidParticleSystem::reload_sdf_and_clear_grid() {
     if (!gpu_ready || !rd) return;
+    // Re-bake SDF for all allocated pages from the terrain (picks up edits).
     _sync_rd();
-    // Re-extract the SDF from the child VoxelTerrain (picks up terrain edits).
-    _refresh_sdf_from_child();
-    // _upload_sdf_data buffer_update's into the existing sdf_storage_buf
-    // (allocated once at grid size in _build_gpu_resources), so the uniform
-    // set never needs rebuilding.
-    _upload_sdf_data();
-    // Update the sdf_bits field in the chunk grid without clearing occupants.
-    _dispatch_clear_grid(true);
+    for (int lod = 0; lod < lod_levels; ++lod) {
+        const Vector3i dims = _lod_table_dims(lod);
+        for (int z = 0; z < dims.z; ++z)
+        for (int y = 0; y < dims.y; ++y)
+        for (int x = 0; x < dims.x; ++x) {
+            const int64_t tidx = _lod_table_index(lod, Vector3i(x, y, z));
+            if (tidx < 0) continue;
+            const LodPageEntry &e = lod_table_cpu[(size_t)tidx];
+            if (!(e.flags & LOD_PAGE_FLAG_ALLOCATED)) continue;
+            _bake_sdf_for_page(lod, Vector3i(x, y, z), e.cell_base);
+        }
+    }
     rd->submit();
     rd->sync();
     rd_submitted = false;
@@ -2114,16 +3788,43 @@ bool FluidParticleSystem::_get(const StringName &p_name, Variant &r_ret) const {
 // ─────────────────────────────────────────────────────────────────────────────
 void FluidParticleSystem::_on_terrain_block_loaded(const Variant &a, const Variant &b,
                                                    const Variant &c, const Variant &d) {
-    _on_terrain_block_event(a, true);
+    _on_terrain_block_event(a, b, true);
 }
 
 void FluidParticleSystem::_on_terrain_block_unloaded(const Variant &a, const Variant &b,
                                                      const Variant &c, const Variant &d) {
-    _on_terrain_block_event(a, false);
+    _on_terrain_block_event(a, b, false);
 }
 
-void FluidParticleSystem::_on_terrain_block_event(const Variant &p_position, bool p_entered) {
+void FluidParticleSystem::_on_terrain_block_event(const Variant &p_position,
+                                                  const Variant &p_lod, bool p_entered) {
     sdf_refresh_pending = true;
+
+    // ── Signal-driven page lifecycle (P2) ─────────────────────────────────
+    // The ONLY path that creates/destroys arena pages. Position arrives as a
+    // Vector3i terrain data-block coord; a page covers exactly one terrain
+    // block, so no math beyond clamping the LOD. Position-only emitters
+    // (legacy 1-arg signals) default to LOD 0 — their coords are LOD0 blocks.
+    {
+        LodEvent ev;
+        ev.loaded = p_entered;
+        ev.lod = (p_lod.get_type() == Variant::INT)
+            ? Math::clamp((int)p_lod, 0, lod_levels - 1)
+            : 0;
+        ev.page_pos = (Vector3i)p_position;
+        pending_lod_events.push_back(ev);
+    }
+
+    // Commit immediately: "this block is ready" → the page's GPU memory is
+    // initialized NOW (table entry written + 64 KB cell block zero-filled with
+    // occupant=-1), not at the next _process. _apply_pending_lod_events owns
+    // the sync/submit boundary, so it's safe to call from a signal callback.
+    // Events only linger in the queue when the GPU isn't up yet (editor,
+    // pre-build); _process drains those leftovers once resources exist.
+    if (gpu_ready && lod_buffers_valid && rd) {
+        _apply_pending_lod_events();
+    }
+
     // Throttled event log: first event logs immediately, then at most one line
     // per 2 s summarizing how many events occurred in between. Keeps streaming
     // feedback visible without flooding the output.
@@ -2143,6 +3844,67 @@ void FluidParticleSystem::_on_terrain_block_event(const Variant &p_position, boo
         terrain_event_log_last_ms = now;
         terrain_event_log_count = 0;
     }
+}
+
+// Phase 3 debug hook: injects a block event through the exact same code path
+// as a real terrain signal — including immediate GPU commit and migration
+// detection. Useful with test scripts, e.g.:
+//   fps.debug_simulate_block_event(Vector3i(4,0,4), 0, true)   # load lod0
+//   fps.debug_simulate_block_event(Vector3i(2,0,2), 1, false)  # unload lod1
+void FluidParticleSystem::debug_simulate_block_event(Vector3i position, int lod, bool loaded) {
+    UtilityFunctions::print("FluidParticleSystem: debug_simulate_block_event ",
+                            loaded ? "load" : "unload", " lod ", lod, " at ", position);
+    _on_terrain_block_event(position, Variant(lod), loaded);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P5: LOD stats. pages/arena numbers come from the CPU allocator mirror;
+// particles_by_lod comes from the GPU stats buffer written by the physics
+// pass (requires one _process cycle after the last dispatch — the readback
+// path syncs the device first, so this is safe to call any time).
+// ─────────────────────────────────────────────────────────────────────────────
+Dictionary FluidParticleSystem::get_lod_stats() {
+    Dictionary out;
+
+    // Pages allocated per LOD, straight from the CPU page table mirror.
+    PackedInt32Array pages_by_lod;
+    pages_by_lod.resize(lod_levels);
+    pages_by_lod.fill(0);
+    for (int k = 0; k < lod_levels; ++k) {
+        const int64_t base = _lod_table_base(k);
+        if (base < 0) continue;
+        const Vector3i d = _lod_table_dims(k);
+        int count = 0;
+        const int64_t end = lod_table_base[k + 1];
+        for (int64_t i = base; i < end; ++i) {
+            if ((lod_table_cpu[(size_t)i].flags & LOD_PAGE_FLAG_ALLOCATED) != 0) ++count;
+        }
+        pages_by_lod[k] = count;
+        (void)d;
+    }
+    out["pages_by_lod"] = pages_by_lod;
+
+    // Particles simulated per LOD last physics dispatch.
+    PackedInt32Array particles_by_lod;
+    particles_by_lod.resize(lod_levels);
+    particles_by_lod.fill(0);
+    if (rd && lod_stats_buf.is_valid()) {
+        _sync_rd();
+        PackedByteArray raw = rd->buffer_get_data(lod_stats_buf, 0,
+                                                   32 * (int64_t)sizeof(int32_t));
+        if (raw.size() >= (int64_t)(lod_levels * (int64_t)sizeof(int32_t))) {
+            for (int k = 0; k < lod_levels; ++k) {
+                int32_t v; memcpy(&v, raw.ptr() + k * 4, 4);
+                particles_by_lod[k] = v;
+            }
+        }
+    }
+    out["particles_by_lod"] = particles_by_lod;
+
+    out["skipped"]             = (int64_t)skipped_particle_count;
+    out["store_ring_pending"]  = 0;
+    out["arena_free_slots"]    = (int64_t)lod_arena.free_count();
+    return out;
 }
 
 bool FluidParticleSystem::_refresh_sdf_from_child() {
@@ -2218,16 +3980,15 @@ bool FluidParticleSystem::_refresh_sdf_from_child() {
         }
     }
 
-    // Force a single-LOD configuration on the VLT so the streamed data and
-    // SDF extraction see the same full-resolution volume the fixed
-    // VoxelTerrain provided (P1 acceptance: observably identical behavior).
-    // lod_count=1 is valid upstream (set_lod_count only rejects < 1). Mesh
-    // block size is pinned to 16 so voxel_to_*_block_position math matches
-    // the fluid grid's 16³ pitch; data block size is already 16 upstream.
+    // Phase 3: let the VLT run lod_count = lod_levels (default 4) so the
+    // terrain actually coarsens/refines and emits multi-LOD block events.
+    // Data block size is 16 upstream; mesh_block_size pinned to 16 so the
+    // block coords match our page coords at every LOD. P1's SDF path only
+    // consumed LOD 0 events, which still arrive (they're a subset).
     if (terrain_is_vlt) {
         Variant lod_count_ret = terrain->get("lod_count");
-        if ((int)lod_count_ret != 1) {
-            terrain->set("lod_count", 1);
+        if ((int)lod_count_ret != lod_levels) {
+            terrain->set("lod_count", lod_levels);
         }
         Variant mbs_ret = terrain->get("mesh_block_size");
         if ((int)mbs_ret != 16) {
@@ -2298,92 +4059,10 @@ bool FluidParticleSystem::_refresh_sdf_from_child() {
         }
     }
 
-    // The terrain covers the same volume as the fluid grid. 1:1 mapping,
-    // same coordinate space — no offset or scale needed.
-
-    // Check that the terrain has a data source. Without a stream or generator,
-    // VoxelTool::copy will succeed but return empty/uninitialized voxels.
-    Variant stream_val = terrain->get("stream");
-    bool has_stream = (stream_val.get_type() != Variant::NIL);
-    Variant gen_val = terrain->get("generator");
-    bool has_generator = (gen_val.get_type() != Variant::NIL);
-    if (!has_stream && !has_generator) {
-        UtilityFunctions::printerr("FluidParticleSystem: terrain child has no stream or generator set — ",
-                                   "VoxelTool::copy will return empty data. ",
-                                   "Set terrain_stream in the inspector.");
-    } else {
-        UtilityFunctions::print("FluidParticleSystem: terrain data source: ",
-                                has_stream ? "stream" : "",
-                                has_stream && has_generator ? " + " : "",
-                                has_generator ? "generator" : "");
-    }
-
-    // Extract the SDF from the terrain via get_voxel_tool().copy().
-    Variant vt_var = terrain->call("get_voxel_tool");
-    Object *vt = Object::cast_to<Object>(vt_var);
-    if (!vt) {
-        UtilityFunctions::printerr("FluidParticleSystem: get_voxel_tool() returned null.");
-        return sdf_storage_buf.is_valid();
-    }
-
-    // Check if the area is fully meshed (all blocks loaded + meshed).
-    // VoxelTool::copy reads from the in-memory block cache (same data the
-    // mesher uses). For blocks not yet streamed, it falls back to the
-    // generator. is_area_meshed tells us if streaming is complete.
-    // VLT's binding takes (AABB, lod_index); legacy VoxelTerrain takes (AABB).
-    AABB grid_aabb(Vector3(0, 0, 0),
-                   Vector3((float)grid_width, (float)grid_height, (float)grid_depth));
-    Variant meshed_ret = terrain_is_vlt
-        ? terrain->call("is_area_meshed", grid_aabb, 0)
-        : terrain->call("is_area_meshed", grid_aabb);
-    bool is_meshed = (bool)meshed_ret;
-    Variant editable_ret = vt->call("is_area_editable", grid_aabb);
-    bool is_editable = (bool)editable_ret;
-    UtilityFunctions::print("FluidParticleSystem: terrain area meshed=", is_meshed,
-                            " editable(loaded)=", is_editable,
-                            " for AABB ", grid_aabb);
-    if (!is_meshed) {
-        UtilityFunctions::printerr("FluidParticleSystem: terrain area is NOT fully meshed — \n",
-                                   "    VoxelTool::copy will use generator fallback for unloaded blocks.\n",
-                                   "    Wait for streaming to complete, or use full_load_mode.");
-    }
-
-    // Create a VoxelBuffer sized to the fluid grid.
-    Variant vb_var = ClassDB::instantiate("VoxelBuffer");
-    Object *vb = Object::cast_to<Object>(vb_var);
-    if (!vb) {
-        UtilityFunctions::printerr("FluidParticleSystem: cannot instantiate VoxelBuffer.");
-        return sdf_storage_buf.is_valid();
-    }
-    vb->call("create", grid_width, grid_height, grid_depth);
-    vb->call("set_channel_depth", 1, 2);  // CHANNEL_SDF=1, DEPTH_32_BIT=2
-
-    // vt.copy(src_pos, dst_buffer, channels_mask, with_metadata)
-    // channels_mask bit 1 = CHANNEL_SDF. Returns an Error (0 = OK).
-    int64_t grid_voxels = (int64_t)grid_width * grid_height * grid_depth;
-    Variant copy_ret = vt->call("copy", Vector3i(0, 0, 0), vb_var, 2, false);
-    int copy_err = (int)copy_ret;
-    if (copy_err != 0) {
-        UtilityFunctions::printerr("FluidParticleSystem: VoxelTool::copy failed with error ",
-                                   copy_err, " (requested ", grid_voxels,
-                                   " voxels = ", grid_width, "x", grid_height,
-                                   "x", grid_depth, ")");
-    } else {
-        UtilityFunctions::print("FluidParticleSystem: VoxelTool::copy OK — ",
-                                grid_voxels, " voxels (", grid_width, "x",
-                                grid_height, "x", grid_depth,
-                                ") copied from child terrain");
-    }
-
-    sdf_buffer_var = vb_var;
-    if (rd && gpu_ready) {
-        _upload_sdf_data();
-    }
-    UtilityFunctions::print("FluidParticleSystem: SDF extraction ",
-                            sdf_storage_buf.is_valid() ? "succeeded" : "FAILED",
-                            " — buffer ", sdf_w, "x", sdf_h, "x", sdf_d,
-                            " = ", (int64_t)sdf_w * sdf_h * sdf_d, " voxels");
-    return sdf_storage_buf.is_valid();
+    // SDF is now baked per-page into arena cells by _bake_sdf_for_page.
+    // No full-grid VoxelBuffer extraction needed — the poller queries the
+    // terrain lazily per page. Return true if the terrain child exists.
+    return terrain != nullptr;
 }
 
 void FluidParticleSystem::_upload_sdf_data() {
@@ -2589,6 +4268,10 @@ void FluidParticleSystem::_reload_compute_shader(int which) {
             path = &sortkey_shader_path; p_shader = &sortkey_shader;
             p_pipeline = &sortkey_pipeline; p_uniform_set = &sortkey_uniform_set;
             name = "sortkey"; break;
+        case 3:
+            path = &migrate_shader_path; p_shader = &migrate_shader;
+            p_pipeline = &migrate_pipeline; p_uniform_set = &migrate_uniform_set;
+            name = "migrate"; break;
         default:
             UtilityFunctions::printerr(
                 "FluidParticleSystem::_reload_compute_shader: invalid index ", which);

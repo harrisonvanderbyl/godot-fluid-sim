@@ -280,6 +280,7 @@ void main() {
 
     // ── LOD resolution: finest allocated page wins ────────────────────
     const ivec3 vp0 = ivec3(round(position));
+    vec3 opos = position;
     int sim_lod = -1;
     for (int k = 0; k < lod_levels; ++k) {
         const int tidx = table_index(k, vp0);
@@ -338,7 +339,7 @@ void main() {
         //   frame 1/4 → 1/4, frame 2/4 → 1/3, frame 3/4 → 1/2, frame 4/4 → 1/1
         // This gives smooth interpolation: 25%, 50%, 75%, 100% across the cycle.
         vec3 rpos_cur = get_render_position(particle_idx);
-        float t = 1.0 / float(stride - frame_in_cycle);
+        float t = 1.0 / float(stride - frame_in_cycle + 1);
         set_render_position(particle_idx, mix(rpos_cur, position, t));
         return;
     }
@@ -357,7 +358,6 @@ void main() {
     if (length(container_force) > 0.0) opacity_fade = 1.0;
 
     bool  firststep    = false;
-    vec3 opos = position;
     ivec3 old_cell_pos = vp0;
     int   old_cidx     = vp0_cidx;
 
@@ -423,7 +423,7 @@ void main() {
     // Gravity: one frame's worth. The position update below scales the ENTIRE
     // momentum by stride, so gravity is already multiplied by stride there.
     // DO NOT pre-multiply gravity by stride — that would give stride².
-    momentum -= pc.gravity;
+    momentum -= pc.gravity * (1 << sim_lod);
 
     // Move: scale by stride so the particle covers stride frames of distance.
     position += momentum * stride_f;
@@ -449,7 +449,7 @@ void main() {
         if (sdf <= 0.0) {
             vec3 n = sdf_normal_at(pcell, 1 << sim_lod);
             
-                position = old_cell_pos;
+                position = opos + reflect(momentum, n) *0.5;
                 float vn = dot(momentum, n);
                 if (vn < 0.0) {
                     momentum -= n * vn * 1.5  ;
@@ -486,7 +486,7 @@ void main() {
     //momentum *= inv_stride;
 
     if (firststep) attract = 0.0;
-    attract /= 1<<sim_lod;
+    //attract /= 1<<sim_lod;
     vec3 spread = momentum * friction;
     vec3 collected = vec3(0.0);
     for (int i = 0; i < n_size; i++) {
@@ -508,7 +508,7 @@ void main() {
     if(sim_lod == 0){
         set_render_position(particle_idx, position);
     }else{
-        set_render_position(particle_idx, old_cell_pos);
+        set_render_position(particle_idx, opos);
     }
     set_custom0(particle_idx, vec4(attraction_force_val, opacity_fade, neighbors_filled, uintBitsToFloat(raw_w)));
 }

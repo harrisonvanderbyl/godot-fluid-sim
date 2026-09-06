@@ -44,6 +44,7 @@ layout(push_constant, std430) uniform PushConstants {
 int   max_occupancy;
 int   lod_levels;
 bool  debug_tint;   // decoded from packed_lod_occ bit 31 (inspector toggle)
+float erosion_strength; // decoded from packed_lod_occ bits 24-30 (0..1)
 
 layout(set = 0, binding = 0, std430) buffer VertexBuffer   { float vtx[]; };
 layout(set = 0, binding = 1, std430) buffer AttribBuffer   { uint  atr[]; };
@@ -237,6 +238,23 @@ vec3 ac_swap0(int cidx) {
         uintBitsToFloat(atomicExchange(acells[cidx].vel_z_bits, 0u)));
 }
 
+// Erosion/deposition: atomically add delta to a cell's SDF value (CAS loop,
+// since sdf_bits is stored as float bits in a uint slot). The CPU's periodic
+// writeback reads this mutated value back out of the arena and pastes it into
+// the terrain's VoxelBuffer, so changes here are what eventually reshapes the
+// mesh. Clamped to a modest band so a single page can't run away to +-inf
+// between writebacks.
+float ac_sdf_atomic_add(int cidx, float delta) {
+    uint prev, next;
+    float result;
+    do {
+        prev = acells[cidx].sdf_bits;
+        result = clamp(uintBitsToFloat(prev) + delta, -4.0, 4.0);
+        next = floatBitsToUint(result);
+    } while (atomicCompSwap(acells[cidx].sdf_bits, prev, next) != prev);
+    return result;
+}
+
 // Try to become the representative of a cell. Returns the previous
 // representative: -1 = admitted.
 int ac_try_join(int cidx, int pidx) {
@@ -258,7 +276,8 @@ const ivec3 NEIGHBOR_OFFSETS[15] = ivec3[15](
 void main() {
     // Decode packed scalars once.
     max_occupancy = pc.packed_lod_occ & 0xFFFF;
-    lod_levels    = (pc.packed_lod_occ >> 16) & 0x7FFF;
+    lod_levels    = (pc.packed_lod_occ >> 16) & 0xFF;    // 8 bits (was 15; freed bits 24-30 below)
+    erosion_strength = float((pc.packed_lod_occ >> 24) & 0x7F) / 127.0;
     debug_tint    = (pc.packed_lod_occ & 0x80000000) != 0;  // P5 debug tint bit
     if (lod_levels <= 0) lod_levels = 1;
 
@@ -373,6 +392,7 @@ void main() {
     vec3  cohesion  = vec3(0.0);   // surface-tension direction (toward same-phase mass)
     vec3  crowd     = vec3(0.0);   // back-pressure direction (away from full cells)
     int   allfilled = 0;
+    float carried_sediment = 0.0;  // SDF mass eroded off harvested cells, deposited on spread
 
     for (int i = 0; i < n_size; i++) {
         ivec3 npos = old_cell_pos + NEIGHBOR_OFFSETS[i] * (1<<sim_lod);
@@ -384,6 +404,21 @@ void main() {
         // cell distances stay voxel-space, so coarser-LOD neighbors read
         // naturally scaled momentum for their cell volume).
         vec3 pooled = ac_swap0(ncidx);
+
+        // Erode a tiny bit of this cell's SDF along with its momentum — the
+        // particle carries it as sediment until the spread step below
+        // deposits it back into whatever cells it ends up pushing into.
+        if (erosion_strength > 0.0) {
+            float sdf_n = uintBitsToFloat(acells[ncidx].sdf_bits);
+            if (sdf_n > SDF_UNSET + 1.0 && sdf_n < 0.0) {
+                const float ERODE_RATE = 0.01;
+                float take = min(ERODE_RATE * erosion_strength, -sdf_n);
+                if (take > 0.0) {
+                    ac_sdf_atomic_add(ncidx, take);
+                    carried_sediment += take;
+                }
+            }
+        }
 
         int occ = acells[ncidx].occupant;
         if (occ >= 0) {
@@ -489,12 +524,19 @@ void main() {
     //attract /= 1<<sim_lod;
     vec3 spread = momentum * friction;
     vec3 collected = vec3(0.0);
+    float sediment_share = carried_sediment * friction;  // same n_size split as momentum
     for (int i = 0; i < n_size; i++) {
         ivec3 npos = new_cell_pos + NEIGHBOR_OFFSETS[i] * (1 << sim_lod);
         int ncidx = in_bounds(npos) ? resolve_cell(npos) : -1;
         if (ncidx >= 0) {
             vec3 push = vec3(NEIGHBOR_OFFSETS[i]) * attract;
             ac_atomic_add(ncidx, spread + push);
+            // Deposit sediment carried from the harvest step above — this is
+            // what actually redistributes SDF: eroded near the old cell,
+            // dropped back down wherever the particle spreads its momentum.
+            if (sediment_share > 0.0 && uintBitsToFloat(acells[ncidx].sdf_bits) > SDF_UNSET + 1.0) {
+                ac_sdf_atomic_add(ncidx, -sediment_share);
+            }
         } else {
             collected += vec3(NEIGHBOR_OFFSETS[i]) * attract + spread;
         }

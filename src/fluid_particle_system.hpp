@@ -102,6 +102,27 @@ public:
     void set_back_pressure(float v) { back_pressure = v; }
     float get_back_pressure()       const { return back_pressure; }
 
+    // ── Erosion (terrain SDF redistribution) ──────────────────────────────
+    // 0 = disabled (default, zero shader cost beyond one branch). >0 lets
+    // fast-flowing water dissolve nearby solid terrain and slow/pooling water
+    // deposit sediment, by mutating the arena's per-cell sdf_bits each physics
+    // step. Purely a GPU-side effect until erosion_writeback_interval frames
+    // have passed, at which point the mutated values are copied back into the
+    // connected VoxelBuffer terrain so the mesh actually updates.
+    void  set_erosion_strength(float v) { erosion_strength = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
+    float get_erosion_strength()  const { return erosion_strength; }
+    // How many simulation frames between terrain writebacks. Higher = fewer
+    // (cheaper) remeshes but choppier visible terrain deformation.
+    void  set_erosion_writeback_interval(int v) { erosion_writeback_interval = v > 1 ? v : 1; }
+    int   get_erosion_writeback_interval() const { return erosion_writeback_interval; }
+    void  set_erosion_writeback_enabled(bool v) { erosion_writeback_enabled = v; }
+    bool  get_erosion_writeback_enabled() const { return erosion_writeback_enabled; }
+    // Copies the LOD-0 arena's (possibly eroded) SDF back into the connected
+    // terrain's VoxelBuffer and triggers a remesh. Called automatically every
+    // erosion_writeback_interval frames when erosion_writeback_enabled is set;
+    // also exposed so it can be triggered manually (e.g. from GDScript).
+    void  writeback_eroded_sdf_to_terrain();
+
     // Simulation toggle
     void set_simulation_active(bool v) { simulation_active = v; }
     bool get_simulation_active()   const { return simulation_active; }
@@ -283,6 +304,12 @@ private:
     int   max_occupancy   = 1;       // max liquid particles per grid cell
     float back_pressure   = 0.0f;    // outward bias as a cell fills
     float fluid_particle_size = 0.1f;  // composite shader uniform
+
+    // ── Erosion (terrain SDF redistribution) ──────────────────────────────
+    float erosion_strength            = 0.0f;   // 0 = off
+    bool  erosion_writeback_enabled   = true;
+    int   erosion_writeback_interval  = 90;      // frames between terrain writebacks
+    int64_t erosion_writeback_cursor  = 0;       // walks the LOD-0 page grid, 1 page/call
 
     // ── simulation toggle ───────────────────────────────────────────────────
     bool  simulation_active = true;

@@ -229,6 +229,16 @@ void FluidParticleSystem::_bind_methods() {
                          &FluidParticleSystem::reload_sdf_and_clear_grid);
     ClassDB::bind_method(D_METHOD("get_reload_sdf_and_clear_grid"),
                          &FluidParticleSystem::get_reload_sdf_and_clear_grid);
+    // Erosion: fast/slow water redistributes terrain SDF, periodically
+    // pasted back into the connected VoxelBuffer terrain.
+    ClassDB::bind_method(D_METHOD("set_erosion_strength", "v"), &FluidParticleSystem::set_erosion_strength);
+    ClassDB::bind_method(D_METHOD("get_erosion_strength"),      &FluidParticleSystem::get_erosion_strength);
+    ClassDB::bind_method(D_METHOD("set_erosion_writeback_enabled", "v"), &FluidParticleSystem::set_erosion_writeback_enabled);
+    ClassDB::bind_method(D_METHOD("get_erosion_writeback_enabled"),      &FluidParticleSystem::get_erosion_writeback_enabled);
+    ClassDB::bind_method(D_METHOD("set_erosion_writeback_interval", "v"), &FluidParticleSystem::set_erosion_writeback_interval);
+    ClassDB::bind_method(D_METHOD("get_erosion_writeback_interval"),      &FluidParticleSystem::get_erosion_writeback_interval);
+    ClassDB::bind_method(D_METHOD("writeback_eroded_sdf_to_terrain"),
+                         &FluidParticleSystem::writeback_eroded_sdf_to_terrain);
     // Internal — signal callbacks from the terrain node, not exposed in the
     // inspector. Trailing DEFVAL args make them callable with 1, 2, 3 or 4
     // args, so one signature fits both the legacy 1-arg emitters (position)
@@ -348,6 +358,17 @@ void FluidParticleSystem::_bind_methods() {
     
     // SDF terrain collision group.
     ADD_GROUP("SDF", "sdf_");
+    ADD_GROUP("", "");
+
+    // Erosion group: fast/slow water redistributes terrain SDF each physics
+    // step; periodically pasted back into the connected VoxelBuffer terrain.
+    ADD_GROUP("Erosion", "erosion_");
+    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "erosion_strength", PROPERTY_HINT_RANGE, "0,1,0.01"),
+        "set_erosion_strength", "get_erosion_strength");
+    ADD_PROPERTY(PropertyInfo(Variant::BOOL, "erosion_writeback_enabled"),
+        "set_erosion_writeback_enabled", "get_erosion_writeback_enabled");
+    ADD_PROPERTY(PropertyInfo(Variant::INT, "erosion_writeback_interval", PROPERTY_HINT_RANGE, "1,600,1"),
+        "set_erosion_writeback_interval", "get_erosion_writeback_interval");
     ADD_GROUP("", "");
 
     // Composite shader uniforms group.
@@ -2653,6 +2674,15 @@ void FluidParticleSystem::_process(double delta) {
 
         if (frame_count % 60 == 0) _dispatch_sortkey();
         frame_count++;
+
+        // Erosion writeback: periodically copy the (possibly eroded/deposited)
+        // LOD-0 arena SDF back into the connected terrain so the mesh actually
+        // updates. Gated on erosion_strength too — no point paying the readback
+        // cost if nothing could have mutated the SDF this session.
+        if (erosion_writeback_enabled && erosion_strength > 0.0f &&
+            (frame_count % (uint64_t)erosion_writeback_interval) == 0) {
+            writeback_eroded_sdf_to_terrain();
+        }
     }
 
     // ── Record the particle draw into the RD framebuffer ─────────────────────
@@ -3243,10 +3273,15 @@ void FluidParticleSystem::_dispatch_physics(Vector3 global_add_velocity,
     pc.custom0_offset_words = custom0_offset_words;
     pc.has_delta        = has_delta ? 1.0f : 0.0f;
     // Shared slot: the LOD-aware physics shader reads this as packed_lod_occ
-    // (low15 = max_occupancy, bits 16-30 = lod_levels, bit 31 = debug tint).
-    // clear_grid/sortkey leave it unused, so packing never disturbs them.
+    // (bits 0-15 = max_occupancy, bits 16-23 = lod_levels, bits 24-30 =
+    // erosion_strength fixed-point 0..127, bit 31 = debug tint). lod_levels
+    // was shrunk from 15 to 8 bits to free room for erosion_strength — 8 bits
+    // is still 32x the practical LOD count. clear_grid/sortkey leave this
+    // slot unused, so packing never disturbs them.
+    const int32_t erosion_fixed = (int32_t)std::round(std::clamp(erosion_strength, 0.0f, 1.0f) * 127.0f);
     pc.max_occupancy    = (debug_tint_by_lod ? (1 << 31) : 0) |
-                          ((int32_t)std::min(lod_levels, 0x7FFF) << 16) |
+                          (erosion_fixed << 24) |
+                          ((int32_t)std::min(lod_levels, 0xFF) << 16) |
                           (max_occupancy & 0xFFFF);
     pc.back_pressure    = back_pressure;
     // Pack 3x3 basis + origin into 3 vec4 rows (row-major):
@@ -3727,6 +3762,143 @@ void FluidParticleSystem::reload_sdf_and_clear_grid() {
     rd->submit();
     rd->sync();
     rd_submitted = false;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Erosion writeback: the inverse of _bake_sdf_for_page. Reads a baked LOD-0
+// page's sdf_bits back out of the arena (where velocity_spread.glsl's
+// erosion/deposition logic may have mutated them) and pastes them into the
+// connected terrain's VoxelBuffer via VoxelTool::paste, so the actual mesh
+// gets re-triangulated around the new surface.
+//
+// Restricted to LOD 0: coarser pages cover multiple voxels per arena cell, so
+// writing them back would downsample/blur real terrain detail. Fine LOD-0
+// water contact is exactly where erosion should be visible anyway.
+//
+// Rate-limited to ONE page per call: a full-grid writeback triggers dozens of
+// VoxelTool::paste calls (each a remesh), which stutters badly if fired all
+// in one frame. erosion_writeback_cursor persists across calls and walks the
+// LOD-0 page grid, so the cost is spread over many frames.
+void FluidParticleSystem::writeback_eroded_sdf_to_terrain() {
+    if (!gpu_ready || !rd) return;
+    Object *terrain = _get_voxel_terrain_child();
+    if (!terrain) return;
+    _sync_rd();
+
+    Variant vt_var = terrain->call("get_voxel_tool");
+    Object *vt = Object::cast_to<Object>(vt_var);
+    if (!vt) return;
+
+    const int lod = 0;
+    const int page_voxels = LOD_PAGE_SIZE << lod;  // 16
+    const Vector3i dims = _lod_table_dims(lod);
+    const int64_t total = (int64_t)dims.x * dims.y * dims.z;
+    if (total <= 0) return;
+
+    for (int64_t tries = 0; tries < total; ++tries) {
+        const int64_t lin = erosion_writeback_cursor % total;
+        erosion_writeback_cursor = lin + 1;
+        const int x = (int)(lin % dims.x);
+        const int y = (int)((lin / dims.x) % dims.y);
+        const int z = (int)(lin / ((int64_t)dims.x * dims.y));
+
+        const int64_t tidx = _lod_table_index(lod, Vector3i(x, y, z));
+        if (tidx < 0) continue;
+        const LodPageEntry &e = lod_table_cpu[(size_t)tidx];
+        if (!(e.flags & LOD_PAGE_FLAG_ALLOCATED)) continue;
+        if (!sdf_baked_pages.count(tidx)) continue;  // never baked -> nothing to write back
+
+        const Vector3i world_origin = grid_window_origin + Vector3i(x, y, z) * page_voxels;
+
+        // Skip pages the terrain won't let us edit (unloaded, out of LOD-0
+        // streaming range, etc.) — VoxelTool::paste silently no-ops on these
+        // with an "Area not editable" warning, so check first.
+        AABB box(Vector3(world_origin), Vector3((float)page_voxels, (float)page_voxels, (float)page_voxels));
+        Variant editable_ret = vt->call("is_area_editable", box);
+        if (editable_ret.get_type() == Variant::BOOL && !(bool)editable_ret) continue;
+
+        // Probe the terrain's real SDF channel depth: paste()/copy_channel_from
+        // assert the source and destination channel depths match exactly, and
+        // the terrain almost always uses quantized 8/16-bit SDF, not float32.
+        Variant probe_var = ClassDB::instantiate("VoxelBuffer");
+        Object *probe = Object::cast_to<Object>(probe_var);
+        if (!probe) continue;
+        probe->call("create", page_voxels, page_voxels, page_voxels);
+        probe->call("set_channel_depth", 1, 2);
+        Variant copy_ret = vt->call("copy", world_origin, probe_var, 1 << 1, false);
+        if ((int)copy_ret != 0) continue;
+        const int depth = (int)(int64_t)probe->call("get_channel_depth", 1);
+        // Old values (as currently baked into the terrain), for the diff
+        // report below. Decoded with the same constants as decode_sdf in
+        // _bake_sdf_for_page.
+        const PackedByteArray old_raw = probe->call("get_channel_as_byte_array", 1);
+        auto decode_old = [&](int64_t idx) -> float {
+            if (old_raw.size() == 0) return 0.0f;
+            if (depth == 0) return std::max((float)reinterpret_cast<const int8_t *>(old_raw.ptr())[idx] / 127.0f, -1.0f) * 10.0f;
+            if (depth == 1) return std::max((float)reinterpret_cast<const int16_t *>(old_raw.ptr())[idx] / 32767.0f, -1.0f) * 500.0f;
+            if (depth == 2) return reinterpret_cast<const float *>(old_raw.ptr())[idx];
+            return (float)reinterpret_cast<const double *>(old_raw.ptr())[idx];
+        };
+
+        PackedByteArray cell_data = rd->buffer_get_data(cell_arena_buf,
+            (uint32_t)((int64_t)e.cell_base * (int64_t)sizeof(GPUChunkCell)),
+            LOD_PAGE_CELLS * (uint32_t)sizeof(GPUChunkCell));
+        if (cell_data.size() == 0) return;
+        const GPUChunkCell *cells = reinterpret_cast<const GPUChunkCell *>(cell_data.ptr());
+
+        const int bytes_per_voxel = depth == 0 ? 1 : depth == 1 ? 2 : depth == 2 ? 4 : 8;
+        PackedByteArray raw;
+        raw.resize((int64_t)page_voxels * page_voxels * page_voxels * bytes_per_voxel);
+        uint8_t *raw_ptr = raw.ptrw();
+        bool any_finite = false;
+        float max_abs_diff = 0.0f;
+        double sum_abs_diff = 0.0;
+        int changed_voxels = 0;
+        // ZXY order, matching decode_sdf's indexing in _bake_sdf_for_page.
+        for (int cz = 0; cz < 16; ++cz)
+        for (int cy = 0; cy < 16; ++cy)
+        for (int cx = 0; cx < 16; ++cx) {
+            const int ci = cx + cy * 16 + cz * 256;
+            float sdf;
+            std::memcpy(&sdf, &cells[ci].sdf_bits, sizeof(float));
+            if (sdf <= SDF_UNSET_VALUE + 1.0f) sdf = 1.0f;  // unbaked cell -> "far outside"
+            else any_finite = true;
+            const int64_t idx = (int64_t)cy + (int64_t)page_voxels * ((int64_t)cx + (int64_t)page_voxels * (int64_t)cz);
+            const float diff = std::abs(sdf - decode_old(idx));
+            if (diff > 1e-4f) {
+                changed_voxels++;
+                sum_abs_diff += diff;
+                if (diff > max_abs_diff) max_abs_diff = diff;
+            }
+            // Inverse of decode_sdf's QUANTIZED_SDF_8/16_BITS_SCALE constants.
+            if (depth == 0) {
+                const float qf = std::clamp(sdf / 10.0f, -1.0f, 1.0f) * 127.0f;
+                reinterpret_cast<int8_t *>(raw_ptr)[idx] = (int8_t)std::lround(qf);
+            } else if (depth == 1) {
+                const float qf = std::clamp(sdf / 500.0f, -1.0f, 1.0f) * 32767.0f;
+                reinterpret_cast<int16_t *>(raw_ptr)[idx] = (int16_t)std::lround(qf);
+            } else if (depth == 2) {
+                reinterpret_cast<float *>(raw_ptr)[idx] = sdf;
+            } else {
+                reinterpret_cast<double *>(raw_ptr)[idx] = (double)sdf;
+            }
+        }
+        if (!any_finite) return;  // whole page still unbaked, nothing changed
+        if (changed_voxels == 0) return;  // baked but erosion hasn't touched it yet
+
+        Variant vb_var = ClassDB::instantiate("VoxelBuffer");
+        Object *vb = Object::cast_to<Object>(vb_var);
+        if (!vb) return;
+        vb->call("create", page_voxels, page_voxels, page_voxels);
+        vb->call("set_channel_depth", 1, depth);
+        vb->call("set_channel_from_byte_array", 1, raw);
+
+        vt->call("paste", world_origin, vb_var, 1 << 1);  // channels_mask: SDF only
+        UtilityFunctions::print("FluidParticleSystem: erosion writeback confirmed at ", world_origin,
+                                " — ", changed_voxels, " voxels changed, max|dsdf|=", max_abs_diff,
+                                " avg|dsdf|=", (float)(sum_abs_diff / changed_voxels));
+        return;  // one page per call — see rate-limit note above
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
